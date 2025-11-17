@@ -178,6 +178,21 @@ checkpoint_step() {
     return 1
 }
 
+# Check if a package is installed
+is_package_installed() {
+    dpkg -l | grep -q "^ii.*$1 " 2>/dev/null
+}
+
+# Check if a service is installed and enabled
+is_service_installed() {
+    systemctl list-unit-files | grep -q "^${1}\.service" 2>/dev/null
+}
+
+# Check if a binary exists in PATH
+is_binary_installed() {
+    command -v "$1" >/dev/null 2>&1
+}
+
 # ============================================================================
 # ERROR HANDLING
 # ============================================================================
@@ -349,29 +364,68 @@ VERIFY_EOF
     run_or_die apt-get update -qq
     run_or_die apt-get upgrade -y
     
-    # Install security tools
+    # Install security tools (only missing ones)
     step "Installing security tools and networking utilities..."
-    run_or_die apt-get install -y \
-      ufw \
-      fail2ban \
-      unattended-upgrades \
-      apt-listchanges \
-      iptables \
-      iproute2 \
-      net-tools
+    MISSING_TOOLS=""
+    for pkg in ufw fail2ban unattended-upgrades apt-listchanges iptables iproute2 net-tools; do
+        if ! is_package_installed "$pkg"; then
+            MISSING_TOOLS="$MISSING_TOOLS $pkg"
+        fi
+    done
+    if [ -n "$MISSING_TOOLS" ]; then
+        run_or_die apt-get install -y $MISSING_TOOLS
+    else
+        info "Security tools already installed, skipping..."
+    fi
     
-    # Configure firewall (UFW)
+    # Configure firewall (UFW) - check if already configured
     step "Configuring firewall (UFW)..."
-    ufw --force enable || true
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow ssh
-    ufw allow 10250/tcp comment 'Kubelet API'
-    ufw allow 10256/tcp comment 'kube-proxy'
-    ufw allow 30000:32767/tcp comment 'NodePort Services'
-    ufw allow 30000:32767/udp comment 'NodePort Services'
-    ufw allow 9100/tcp comment 'Node Exporter (Prometheus)'
-    ufw allow 24224/tcp comment 'Fluent Bit forward'
+    if ! ufw status | grep -q "Status: active"; then
+        ufw --force enable || true
+        ufw default deny incoming
+        ufw default allow outgoing
+    else
+        info "UFW is already enabled, skipping basic configuration..."
+    fi
+    
+    # Add SSH rule if not exists
+    if ! ufw status | grep -q "22/tcp"; then
+        ufw allow ssh
+    else
+        info "SSH rule already exists, skipping..."
+    fi
+    
+    # Add Kubernetes and monitoring ports (only if not already present)
+    if ! ufw status | grep -q "10250/tcp"; then
+        ufw allow 10250/tcp comment 'Kubelet API'
+    else
+        info "Kubelet API rule already exists, skipping..."
+    fi
+    
+    if ! ufw status | grep -q "10256/tcp"; then
+        ufw allow 10256/tcp comment 'kube-proxy'
+    else
+        info "kube-proxy rule already exists, skipping..."
+    fi
+    
+    if ! ufw status | grep -q "30000:32767/tcp"; then
+        ufw allow 30000:32767/tcp comment 'NodePort Services'
+        ufw allow 30000:32767/udp comment 'NodePort Services'
+    else
+        info "NodePort Services rules already exist, skipping..."
+    fi
+    
+    if ! ufw status | grep -q "9100/tcp"; then
+        ufw allow 9100/tcp comment 'Node Exporter (Prometheus)'
+    else
+        info "Node Exporter rule already exists, skipping..."
+    fi
+    
+    if ! ufw status | grep -q "24224/tcp"; then
+        ufw allow 24224/tcp comment 'Fluent Bit forward'
+    else
+        info "Fluent Bit rule already exists, skipping..."
+    fi
     success "Firewall configured"
     
     # Configure automatic security updates
@@ -621,19 +675,37 @@ EOF
     else
     step "Installing containerd ${CONTAINERD_VERSION}"
     
-    # Install dependencies
-    step "Installing containerd dependencies..."
-    run_or_die apt-get update -qq
-    run_or_die apt-get install -y ca-certificates curl gnupg lsb-release jq
-    
-    # Setup Docker repository
-    step "Setting up Docker repository for containerd.io package..."
-    run_or_die mkdir -p /etc/apt/keyrings
-    run_or_die curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-    
-    run_or_die apt-get update -qq
-    run_or_die apt-get install -y containerd.io
+    # Check if containerd is already installed
+    if is_package_installed containerd.io && is_binary_installed containerd && is_binary_installed runc; then
+        success "containerd is already installed - skipping installation"
+    else
+        # Install dependencies
+        step "Installing containerd dependencies..."
+        if ! is_package_installed ca-certificates || ! is_package_installed curl || ! is_package_installed gnupg || ! is_package_installed lsb-release || ! is_package_installed jq; then
+            run_or_die apt-get update -qq
+            run_or_die apt-get install -y ca-certificates curl gnupg lsb-release jq
+        else
+            info "Dependencies already installed, skipping..."
+        fi
+        
+        # Setup Docker repository (only if not already configured)
+        if [ ! -f /etc/apt/sources.list.d/docker.list ]; then
+            step "Setting up Docker repository for containerd.io package..."
+            run_or_die mkdir -p /etc/apt/keyrings
+            run_or_die curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+            run_or_die apt-get update -qq
+        else
+            info "Docker repository already configured, skipping..."
+            apt-get update -qq || true
+        fi
+        
+        if ! is_package_installed containerd.io; then
+            run_or_die apt-get install -y containerd.io
+        else
+            success "containerd.io package already installed"
+        fi
+    fi
     
     # Verify installation
     step "Verifying containerd installation..."
@@ -671,10 +743,12 @@ EOF
         fi
     fi
     
-    # Ensure CRI plugin is enabled
+    # Ensure CRI plugin is enabled (only if it's disabled)
     step "Ensuring CRI plugin is enabled..."
-    if [ -f /etc/containerd/config.toml ] && grep -q "disabled_plugins" /etc/containerd/config.toml; then
-        if grep -A 10 "disabled_plugins" /etc/containerd/config.toml | grep -q '"cri"'; then
+    if [ -f /etc/containerd/config.toml ]; then
+        # Check if CRI is in disabled_plugins list
+        if grep -q "disabled_plugins" /etc/containerd/config.toml && grep -A 10 "disabled_plugins" /etc/containerd/config.toml | grep -q '"cri"'; then
+            # CRI is disabled, need to enable it
             sed -i '/disabled_plugins/,/\]/ {
                 s/"cri"//g
                 s/'\''cri'\''//g
@@ -683,25 +757,46 @@ EOF
                 s/,\s*\]/]/g
             }' /etc/containerd/config.toml
             success "Removed 'cri' from disabled_plugins list"
+        else
+            # CRI is not disabled (either not in list or list doesn't exist)
+            info "CRI plugin is already enabled, skipping..."
         fi
+    else
+        warn "containerd config.toml not found, skipping CRI check"
     fi
     
-    # Configure systemd cgroup driver
+    # Configure systemd cgroup driver (only if not already configured)
     step "Configuring systemd cgroup driver..."
-    if [ -f /etc/containerd/config.toml ] && grep -q '\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]' /etc/containerd/config.toml; then
-        sed -i '/\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]/,/^\[/ {
-            s/SystemdCgroup = false/SystemdCgroup = true/
-        }' /etc/containerd/config.toml
-    else
-        cat >> /etc/containerd/config.toml <<'EOF'
+    if [ -f /etc/containerd/config.toml ]; then
+        # Check if SystemdCgroup is already set to true
+        if grep -A 2 '\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]' /etc/containerd/config.toml | grep -q "SystemdCgroup = true"; then
+            info "SystemdCgroup is already set to true, skipping..."
+        elif grep -q '\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]' /etc/containerd/config.toml; then
+            # Section exists but SystemdCgroup is false or missing
+            if grep -A 2 '\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]' /etc/containerd/config.toml | grep -q "SystemdCgroup = false"; then
+                sed -i '/\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]/,/^\[/ {
+                    s/SystemdCgroup = false/SystemdCgroup = true/
+                }' /etc/containerd/config.toml
+                success "Updated SystemdCgroup to true"
+            else
+                # Section exists but SystemdCgroup line is missing, add it
+                sed -i '/\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]/a\    SystemdCgroup = true' /etc/containerd/config.toml
+                success "Added SystemdCgroup = true"
+            fi
+        else
+            # Section doesn't exist, add it
+            cat >> /etc/containerd/config.toml <<'EOF'
 
 # Systemd cgroup driver configuration for Kubernetes
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
   [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
     SystemdCgroup = true
 EOF
+            success "Added SystemdCgroup configuration"
+        fi
+    else
+        warn "containerd config.toml not found, skipping SystemdCgroup configuration"
     fi
-    success "SystemdCgroup driver enabled"
     
     # Configure registry mirrors (always append if missing)
     step "Configuring containerd registry mirrors..."
@@ -755,96 +850,142 @@ EOF
     else
     step "Installing Kubernetes ${KUBERNETES_VERSION}"
     
-    K8S_MINOR_VERSION=$(echo "$KUBERNETES_VERSION" | cut -d. -f1,2)
-    K8S_REPO_VERSION="v${K8S_MINOR_VERSION}"
-    
-    # Install prerequisites
-    step "Installing prerequisites for Kubernetes repository..."
-    run_or_die apt-get update -qq
-    run_or_die apt-get install -y apt-transport-https ca-certificates curl gpg
-    
-    # Add Kubernetes repository
-    step "Adding Kubernetes ${K8S_REPO_VERSION} repository..."
-    run_or_die mkdir -p -m 755 /etc/apt/keyrings
-    if ! retry_curl "https://pkgs.k8s.io/core:/stable:/${K8S_REPO_VERSION}/deb/Release.key" "/tmp/k8s-key.gpg"; then
-        error "Failed to download Kubernetes repository key"
-        exit 1
-    fi
-    gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg < /tmp/k8s-key.gpg
-    rm -f /tmp/k8s-key.gpg
-    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${K8S_REPO_VERSION}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
-    
-    run_or_die apt-get update -qq
-    
-    # Auto-detect exact Kubernetes version from repository
-    # Supports minor version (e.g., 1.28) to pick latest patch, or full version (e.g., 1.28.0)
-    step "Detecting available Kubernetes version..."
-    
-    # If KUBERNETES_VERSION is minor (e.g., 1.28), match any patch version
-    # If it's full (e.g., 1.28.0), match exact version
-    if [[ "$KUBERNETES_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
-        # Minor version - match any patch (e.g., 1.28 matches 1.28.0, 1.28.1, etc.)
-        AVAILABLE_VERSION=$(apt-cache madison kubeadm | awk '{print $3}' | grep "^${KUBERNETES_VERSION}\." | head -n 1)
-        info "Minor version specified (${KUBERNETES_VERSION}), selecting latest patch"
+    # Check if Kubernetes packages are already installed
+    if is_package_installed kubelet && is_package_installed kubeadm && is_package_installed kubectl; then
+        success "Kubernetes packages (kubelet, kubeadm, kubectl) are already installed - skipping installation"
+        # Still need to get the version for image preloading
+        K8S_MINOR_VERSION=$(echo "$KUBERNETES_VERSION" | cut -d. -f1,2)
+        K8S_REPO_VERSION="v${K8S_MINOR_VERSION}"
+        # Get installed version
+        AVAILABLE_VERSION=$(dpkg -l | grep -E "^ii.*kubeadm" | awk '{print $3}' | head -1)
+        if [ -n "$AVAILABLE_VERSION" ]; then
+            K8S_PURE_VERSION="${AVAILABLE_VERSION%%-*}"
+            info "Detected installed Kubernetes version: ${K8S_PURE_VERSION}"
+        fi
     else
-        # Full version specified - match exact
-        AVAILABLE_VERSION=$(apt-cache madison kubeadm | awk '{print $3}' | grep "^${KUBERNETES_VERSION}" | head -n 1)
-        info "Full version specified (${KUBERNETES_VERSION})"
+        K8S_MINOR_VERSION=$(echo "$KUBERNETES_VERSION" | cut -d. -f1,2)
+        K8S_REPO_VERSION="v${K8S_MINOR_VERSION}"
+        
+        # Install prerequisites (only if missing)
+        step "Installing prerequisites for Kubernetes repository..."
+        MISSING_DEPS=""
+        for pkg in apt-transport-https ca-certificates curl gpg; do
+            if ! is_package_installed "$pkg"; then
+                MISSING_DEPS="$MISSING_DEPS $pkg"
+            fi
+        done
+        if [ -n "$MISSING_DEPS" ]; then
+            run_or_die apt-get update -qq
+            run_or_die apt-get install -y $MISSING_DEPS
+        else
+            info "Prerequisites already installed, skipping..."
+        fi
+        
+        # Add Kubernetes repository (only if not already configured)
+        if [ ! -f /etc/apt/sources.list.d/kubernetes.list ]; then
+            step "Adding Kubernetes ${K8S_REPO_VERSION} repository..."
+            run_or_die mkdir -p -m 755 /etc/apt/keyrings
+            if ! retry_curl "https://pkgs.k8s.io/core:/stable:/${K8S_REPO_VERSION}/deb/Release.key" "/tmp/k8s-key.gpg"; then
+                error "Failed to download Kubernetes repository key"
+                exit 1
+            fi
+            gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg < /tmp/k8s-key.gpg
+            rm -f /tmp/k8s-key.gpg
+            echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${K8S_REPO_VERSION}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+            run_or_die apt-get update -qq
+        else
+            info "Kubernetes repository already configured, skipping..."
+            apt-get update -qq || true
+        fi
+        
+        # Auto-detect exact Kubernetes version from repository
+        # Supports minor version (e.g., 1.28) to pick latest patch, or full version (e.g., 1.28.0)
+        step "Detecting available Kubernetes version..."
+        
+        # If KUBERNETES_VERSION is minor (e.g., 1.28), match any patch version
+        # If it's full (e.g., 1.28.0), match exact version
+        if [[ "$KUBERNETES_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            # Minor version - match any patch (e.g., 1.28 matches 1.28.0, 1.28.1, etc.)
+            AVAILABLE_VERSION=$(apt-cache madison kubeadm | awk '{print $3}' | grep "^${KUBERNETES_VERSION}\." | head -n 1)
+            info "Minor version specified (${KUBERNETES_VERSION}), selecting latest patch"
+        else
+            # Full version specified - match exact
+            AVAILABLE_VERSION=$(apt-cache madison kubeadm | awk '{print $3}' | grep "^${KUBERNETES_VERSION}" | head -n 1)
+            info "Full version specified (${KUBERNETES_VERSION})"
+        fi
+        
+        if [ -z "$AVAILABLE_VERSION" ]; then
+            error "Kubernetes version ${KUBERNETES_VERSION} not found in repository"
+            info "Available versions:"
+            apt-cache madison kubeadm | head -10 || true
+            error "Please set KUBERNETES_VERSION to an available version (minor like 1.28 or full like 1.28.0)"
+            exit 1
+        fi
+        
+        info "Found version: ${AVAILABLE_VERSION}"
+        
+        # Store pure version (strip Debian suffix) for image preloading
+        K8S_PURE_VERSION="${AVAILABLE_VERSION%%-*}"
+        info "Pure version for images: ${K8S_PURE_VERSION}"
+        
+        # Install Kubernetes components with auto-detected version
+        step "Installing kubectl, kubelet, and kubeadm..."
+        if ! is_package_installed kubectl || ! is_package_installed kubelet || ! is_package_installed kubeadm; then
+            run_or_die apt-get install -y \
+              kubectl="$AVAILABLE_VERSION" \
+              kubelet="$AVAILABLE_VERSION" \
+              kubeadm="$AVAILABLE_VERSION"
+            success "Kubernetes components installed"
+        else
+            success "Kubernetes components already installed"
+        fi
+        
+        # Hold packages (idempotent - safe to run multiple times)
+        apt-mark hold kubelet kubeadm kubectl 2>/dev/null || true
     fi
-    
-    if [ -z "$AVAILABLE_VERSION" ]; then
-        error "Kubernetes version ${KUBERNETES_VERSION} not found in repository"
-        info "Available versions:"
-        apt-cache madison kubeadm | head -10 || true
-        error "Please set KUBERNETES_VERSION to an available version (minor like 1.28 or full like 1.28.0)"
-        exit 1
-    fi
-    
-    info "Found version: ${AVAILABLE_VERSION}"
-    
-    # Store pure version (strip Debian suffix) for image preloading
-    K8S_PURE_VERSION="${AVAILABLE_VERSION%%-*}"
-    info "Pure version for images: ${K8S_PURE_VERSION}"
-    
-    # Install Kubernetes components with auto-detected version
-    step "Installing kubectl, kubelet, and kubeadm..."
-    run_or_die apt-get install -y \
-      kubectl="$AVAILABLE_VERSION" \
-      kubelet="$AVAILABLE_VERSION" \
-      kubeadm="$AVAILABLE_VERSION"
-    
-    # Hold packages
-    run_or_die apt-mark hold kubelet kubeadm kubectl
-    success "Kubernetes components installed"
     
     # Install crictl (keep "v" prefix in URL)
     step "Installing crictl ${CRICTL_VERSION}..."
-    CRICTL_URL="https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz"
-    TMP_CRICTL="/tmp/crictl.tar.gz"
-    mkdir -p /usr/local/bin
+    # Check multiple possible locations for crictl
+    if is_binary_installed crictl || [ -f /usr/local/bin/crictl ] || [ -f /usr/bin/crictl ]; then
+        success "crictl is already installed - skipping installation"
+        # Verify it's executable
+        if [ -f /usr/local/bin/crictl ]; then
+            chmod +x /usr/local/bin/crictl 2>/dev/null || true
+        fi
+    else
+        CRICTL_URL="https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz"
+        TMP_CRICTL="/tmp/crictl.tar.gz"
+        mkdir -p /usr/local/bin
+        
+        if retry_curl "$CRICTL_URL" "$TMP_CRICTL"; then
+            if tar -tzf "$TMP_CRICTL" >/dev/null 2>&1; then
+                tar -xzf "$TMP_CRICTL" -C /usr/local/bin
+                chmod +x /usr/local/bin/crictl
+                rm -f "$TMP_CRICTL"
+                success "crictl installed"
+            else
+                warn "crictl archive is not valid"
+                rm -f "$TMP_CRICTL"
+            fi
+        else
+            warn "Failed to download crictl"
+        fi
+    fi
     
-    if retry_curl "$CRICTL_URL" "$TMP_CRICTL"; then
-        if tar -tzf "$TMP_CRICTL" >/dev/null 2>&1; then
-            tar -xzf "$TMP_CRICTL" -C /usr/local/bin
-            rm -f "$TMP_CRICTL"
-            success "crictl installed"
-            
-            # Configure crictl to use containerd socket
-            info "Configuring crictl to use containerd..."
-            mkdir -p /etc
-            cat > /etc/crictl.yaml <<'CRICTL_EOF'
+    # Configure crictl to use containerd socket (always configure, even if already installed)
+    if [ ! -f /etc/crictl.yaml ]; then
+        info "Configuring crictl to use containerd..."
+        mkdir -p /etc
+        cat > /etc/crictl.yaml <<'CRICTL_EOF'
 runtime-endpoint: unix:///run/containerd/containerd.sock
 image-endpoint: unix:///run/containerd/containerd.sock
 timeout: 10
 debug: false
 CRICTL_EOF
-            success "crictl configured to use containerd socket"
-        else
-            warn "crictl archive is not valid"
-            rm -f "$TMP_CRICTL"
-        fi
+        success "crictl configured to use containerd socket"
     else
-        warn "Failed to download crictl"
+        info "crictl configuration already exists, skipping..."
     fi
     
     # Configure kubelet
