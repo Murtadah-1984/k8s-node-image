@@ -139,6 +139,46 @@ cleanup() {
 }
 
 # ============================================================================
+# CHECKPOINT SYSTEM (for idempotent script execution)
+# ============================================================================
+CHECKPOINT_DIR="/var/lib/k8s-node-bootstrap/checkpoints"
+
+# Initialize checkpoint directory
+init_checkpoints() {
+    mkdir -p "$CHECKPOINT_DIR" 2>/dev/null || true
+}
+
+# Check if a checkpoint exists
+checkpoint_exists() {
+    local checkpoint_name="$1"
+    [ -f "${CHECKPOINT_DIR}/${checkpoint_name}.done" ]
+}
+
+# Mark a checkpoint as completed
+mark_checkpoint() {
+    local checkpoint_name="$1"
+    local checkpoint_file="${CHECKPOINT_DIR}/${checkpoint_name}.done"
+    echo "$(date -Iseconds)" > "$checkpoint_file"
+    debug "Checkpoint marked: $checkpoint_name"
+}
+
+# Skip step if checkpoint exists, otherwise run and mark
+checkpoint_step() {
+    local checkpoint_name="$1"
+    shift
+    local step_description="$*"
+    
+    if checkpoint_exists "$checkpoint_name"; then
+        local checkpoint_time=$(cat "${CHECKPOINT_DIR}/${checkpoint_name}.done" 2>/dev/null || echo "unknown")
+        success "Step '$checkpoint_name' already completed (at $checkpoint_time) - skipping"
+        return 0
+    fi
+    
+    info "Running step: $step_description"
+    return 1
+}
+
+# ============================================================================
 # ERROR HANDLING
 # ============================================================================
 trap 'error "Script failed at line $LINENO: $BASH_COMMAND"; cleanup' ERR
@@ -161,6 +201,11 @@ main() {
     # Setup logging
     mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
     exec > >(tee -a "$LOGFILE") 2>&1
+    
+    # Initialize checkpoint system
+    init_checkpoints
+    info "Checkpoint system initialized at $CHECKPOINT_DIR"
+    info "To force re-run of all steps, delete: $CHECKPOINT_DIR"
     
     # ----------------------------------------------------------------------
     # 0. System Verification and Preflight Checks
@@ -203,9 +248,12 @@ main() {
     # ----------------------------------------------------------------------
     # STEP 0: Unique Identifiers
     # ----------------------------------------------------------------------
-    step "Creating node uniqueness verification script"
-    
-    # Install uuidgen if not available
+    if checkpoint_step "step0-unique-identifiers" "Creating node uniqueness verification script"; then
+        : # Step already completed, skip
+    else
+        step "Creating node uniqueness verification script"
+        
+        # Install uuidgen if not available
     if ! command -v uuidgen >/dev/null 2>&1; then
         info "Installing uuid-runtime package..."
         apt-get update -qq || {
@@ -285,10 +333,15 @@ VERIFY_EOF
     
     run_or_die chmod +x /usr/local/bin/verify-node-uniqueness.sh
     success "Node uniqueness verification script installed"
+    mark_checkpoint "step0-unique-identifiers"
+    fi
     
     # ----------------------------------------------------------------------
     # STEP 1: System Hardening (CIS Benchmark Level 1)
     # ----------------------------------------------------------------------
+    if checkpoint_step "step1-hardening" "Starting system hardening (CIS Benchmark Level 1)"; then
+        : # Step already completed, skip
+    else
     step "Starting system hardening (CIS Benchmark Level 1)"
     
     # Update system
@@ -480,10 +533,15 @@ EOF
     success "Timezone set to ${TIMEZONE}"
     
     success "System hardening completed"
+    mark_checkpoint "step1-hardening"
+    fi
     
     # ----------------------------------------------------------------------
     # STEP 2: Kernel Configuration for Kubernetes
     # ----------------------------------------------------------------------
+    if checkpoint_step "step2-kernel" "Configuring kernel parameters for Kubernetes"; then
+        : # Step already completed, skip
+    else
     step "Configuring kernel parameters for Kubernetes"
     
     # Load required kernel modules
@@ -552,10 +610,15 @@ EOF
     fi
     
     success "Kernel configuration completed"
+    mark_checkpoint "step2-kernel"
+    fi
     
     # ----------------------------------------------------------------------
     # STEP 3: Containerd Installation
     # ----------------------------------------------------------------------
+    if checkpoint_step "step3-containerd" "Installing containerd ${CONTAINERD_VERSION}"; then
+        : # Step already completed, skip
+    else
     step "Installing containerd ${CONTAINERD_VERSION}"
     
     # Install dependencies
@@ -681,10 +744,15 @@ EOF
     fi
     
     success "Containerd installation completed"
+    mark_checkpoint "step3-containerd"
+    fi
     
     # ----------------------------------------------------------------------
     # STEP 4: Kubernetes Installation
     # ----------------------------------------------------------------------
+    if checkpoint_step "step4-kubernetes" "Installing Kubernetes ${KUBERNETES_VERSION}"; then
+        : # Step already completed, skip
+    else
     step "Installing Kubernetes ${KUBERNETES_VERSION}"
     
     K8S_MINOR_VERSION=$(echo "$KUBERNETES_VERSION" | cut -d. -f1,2)
@@ -760,6 +828,17 @@ EOF
             tar -xzf "$TMP_CRICTL" -C /usr/local/bin
             rm -f "$TMP_CRICTL"
             success "crictl installed"
+            
+            # Configure crictl to use containerd socket
+            info "Configuring crictl to use containerd..."
+            mkdir -p /etc
+            cat > /etc/crictl.yaml <<'CRICTL_EOF'
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 10
+debug: false
+CRICTL_EOF
+            success "crictl configured to use containerd socket"
         else
             warn "crictl archive is not valid"
             rm -f "$TMP_CRICTL"
@@ -801,10 +880,15 @@ EOF
     success "kubelet service enabled"
     
     success "Kubernetes installation completed"
+    mark_checkpoint "step4-kubernetes"
+    fi
     
     # ----------------------------------------------------------------------
     # STEP 4b: Pre-load Kubernetes Images (MANDATORY)
     # ----------------------------------------------------------------------
+    if checkpoint_step "step4b-preload-images" "Pre-loading Kubernetes container images (MANDATORY)"; then
+        : # Step already completed, skip
+    else
     step "Pre-loading Kubernetes container images (MANDATORY)"
     
     info "Checking containerd service status..."
@@ -838,35 +922,41 @@ EOF
     fi
     success "containerd socket found at $SOCKET_PATH"
     
+    # Ensure crictl uses containerd socket (set environment variable as well)
+    export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
+    export IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock
+    
     info "Testing containerd connectivity with crictl..."
     timeout=120
     counter=0
-    while ! crictl info &>/dev/null && [ $counter -lt $timeout ]; do
+    while ! CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock crictl info &>/dev/null && [ $counter -lt $timeout ]; do
         if [ $((counter % 10)) -eq 0 ] && [ $counter -gt 0 ]; then
             info "Still waiting for containerd... (${counter}s/${timeout}s)"
             debug "Testing crictl connection..."
-            crictl info 2>&1 | head -5 || true
+            CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock crictl info 2>&1 | head -5 || true
         fi
         sleep 2
         counter=$((counter + 2))
     done
     
-    if ! crictl info &>/dev/null; then
+    if ! CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock crictl info &>/dev/null; then
         error "containerd is not responding to crictl commands"
         info "Diagnostics:"
         info "  - Service status:"
         systemctl status containerd --no-pager -l | head -10 || true
         info "  - Socket permissions:"
         ls -la "$SOCKET_PATH" || true
+        info "  - crictl config file:"
+        cat /etc/crictl.yaml 2>/dev/null || warn "crictl config file not found"
         info "  - crictl info output:"
-        crictl info 2>&1 || true
+        CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock crictl info 2>&1 || true
         info "  - Recent containerd logs:"
         journalctl -u containerd -n 30 --no-pager | tail -20 || true
         error "containerd must be fully operational to pre-load images"
         exit 1
     fi
     
-    CRICTL_INFO=$(crictl info 2>&1)
+    CRICTL_INFO=$(CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock crictl info 2>&1)
     success "containerd is ready and responding"
     debug "containerd info: $(echo "$CRICTL_INFO" | head -3)"
     
@@ -900,7 +990,7 @@ EOF
             continue
         fi
         info "[${IMAGE_COUNT}/${TOTAL_IMAGES}] Pulling: $image"
-        if crictl pull "$image" 2>&1; then
+        if CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock crictl pull "$image" 2>&1; then
             IMAGE_COUNT=$((IMAGE_COUNT + 1))
             success "Successfully pulled: $image"
         else
@@ -929,16 +1019,23 @@ EOF
     
     success "Successfully pre-loaded ${IMAGE_COUNT} Kubernetes image(s) for version v${K8S_PURE_VERSION}"
     info "Verifying images are available..."
-    VERIFIED_COUNT=$(crictl images 2>/dev/null | grep -c "k8s.gcr.io\|registry.k8s.io" || echo "0")
+    VERIFIED_COUNT=$(CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock crictl images 2>/dev/null | grep -c "k8s.gcr.io\|registry.k8s.io" || echo "0")
     if [ "$VERIFIED_COUNT" -gt 0 ]; then
         success "Verified ${VERIFIED_COUNT} Kubernetes image(s) in containerd storage"
     else
         warn "Could not verify images in containerd storage (this may be normal)"
     fi
     
+    success "Kubernetes images pre-loaded successfully"
+    mark_checkpoint "step4b-preload-images"
+    fi
+    
     # ----------------------------------------------------------------------
     # STEP 5: Monitoring Components (Enabled by Default)
     # ----------------------------------------------------------------------
+    if checkpoint_step "step5-monitoring" "Installing monitoring components"; then
+        : # Step already completed, skip
+    else
     step "Installing monitoring components..."
     
     # 5.1: Monitoring Base (journald, logrotate)
@@ -1146,10 +1243,15 @@ EOF
     fi
     
     success "Monitoring components installation completed"
+    mark_checkpoint "step5-monitoring"
+    fi
     
     # ----------------------------------------------------------------------
     # STEP 6: Final System Configuration
     # ----------------------------------------------------------------------
+    if checkpoint_step "step6-final-config" "Applying final system configuration"; then
+        : # Step already completed, skip
+    else
     step "Applying final system configuration..."
     
     # Disable swap (ensure it's still disabled)
@@ -1172,10 +1274,15 @@ EOF
     fi
     
     success "Final system configuration completed"
+    mark_checkpoint "step6-final-config"
+    fi
     
     # ----------------------------------------------------------------------
     # STEP 7: Cleanup
     # ----------------------------------------------------------------------
+    if checkpoint_step "step7-cleanup" "Cleaning up system"; then
+        : # Step already completed, skip
+    else
     step "Cleaning up system"
     
     # Remove unnecessary packages
@@ -1200,6 +1307,8 @@ EOF
     rm -rf /var/tmp/* 2>/dev/null || true
     
     success "Cleanup completed"
+    mark_checkpoint "step7-cleanup"
+    fi
     
     # ----------------------------------------------------------------------
     # DONE
