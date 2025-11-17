@@ -1329,15 +1329,41 @@ EOF
             run_or_die apt-get install -y lsb-release
         fi
         
-        # Add Fluent Bit repository
+        # Add Fluent Bit repository (only if not already configured)
         mkdir -p /usr/share/keyrings
         mkdir -p /etc/apt/sources.list.d
-        run_or_die curl -fsSL https://packages.fluentbit.io/fluentbit.key | gpg --dearmor > /usr/share/keyrings/fluentbit.gpg
-        run_or_die echo "deb [signed-by=/usr/share/keyrings/fluentbit.gpg] https://packages.fluentbit.io/debian/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/fluentbit.list
+        
+        # Check if repository file exists and is valid
+        if [ -f /etc/apt/sources.list.d/fluentbit.list ]; then
+            # Validate the file format
+            if grep -q "^deb.*packages.fluentbit.io" /etc/apt/sources.list.d/fluentbit.list 2>/dev/null; then
+                info "Fluent Bit repository already configured, skipping..."
+            else
+                warn "Fluent Bit repository file exists but appears malformed, recreating..."
+                rm -f /etc/apt/sources.list.d/fluentbit.list
+            fi
+        fi
+        
+        if [ ! -f /etc/apt/sources.list.d/fluentbit.list ]; then
+            info "Adding Fluent Bit repository..."
+            if retry_curl "https://packages.fluentbit.io/fluentbit.key" "/tmp/fluentbit.key"; then
+                gpg --dearmor < /tmp/fluentbit.key > /usr/share/keyrings/fluentbit.gpg
+                rm -f /tmp/fluentbit.key
+                echo "deb [signed-by=/usr/share/keyrings/fluentbit.gpg] https://packages.fluentbit.io/debian/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/fluentbit.list > /dev/null
+                success "Fluent Bit repository added"
+            else
+                error "Failed to download Fluent Bit GPG key"
+                exit 1
+            fi
+        fi
         
         # Install Fluent Bit
-        run_or_die apt-get update -qq
-        run_or_die apt-get install -y fluent-bit
+        if ! is_package_installed fluent-bit; then
+            run_or_die apt-get update -qq
+            run_or_die apt-get install -y fluent-bit
+        else
+            success "fluent-bit package already installed"
+        fi
         
         # Create configuration
         mkdir -p /etc/fluent-bit
