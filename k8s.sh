@@ -1334,8 +1334,18 @@ EOF
         mkdir -p /usr/share/keyrings
         mkdir -p /etc/apt/sources.list.d
         
+        # Clean up any old/incorrect repository files first
+        rm -f /etc/apt/sources.list.d/fluentbit.list 2>/dev/null || true
+        
         # Get codename (official method from Fluent Bit docs)
         OS_CODENAME=$(grep -oP '(?<=VERSION_CODENAME=).*' /etc/os-release 2>/dev/null || lsb_release -cs 2>/dev/null || echo "jammy")
+        
+        # Validate codename is not empty
+        if [ -z "$OS_CODENAME" ] || [ "$OS_CODENAME" = "" ]; then
+            error "Failed to detect OS codename"
+            exit 1
+        fi
+        info "Detected OS codename: ${OS_CODENAME}"
         
         # Detect OS type for correct repository path
         if grep -qi ubuntu /etc/os-release 2>/dev/null; then
@@ -1350,8 +1360,8 @@ EOF
         
         # Check if repository file exists and is valid
         if [ -f "$SOURCES_FILE" ]; then
-            # Validate the file format - check for proper deb line
-            if grep -qE "^deb\s+\[.*\]\s+https://packages\.fluentbit\.io/" "$SOURCES_FILE" 2>/dev/null; then
+            # Validate the file format - check for proper deb line and no errors
+            if grep -qE "^deb\s+\[.*\]\s+https://packages\.fluentbit\.io/" "$SOURCES_FILE" 2>/dev/null && ! grep -qE "^[^#].*unknown\|^[^#].*not known" "$SOURCES_FILE" 2>/dev/null; then
                 info "Fluent Bit repository already configured, skipping..."
             else
                 warn "Fluent Bit repository file exists but appears malformed, removing..."
@@ -1371,16 +1381,30 @@ EOF
                 rm -f /tmp/fluentbit.key
                 
                 # Create repository file with correct format (official format from Fluent Bit docs)
-                cat > "$SOURCES_FILE" <<EOF
-deb [signed-by=${KEYRING_FILE}] https://packages.fluentbit.io/${REPO_PATH}/${OS_CODENAME} ${OS_CODENAME} main
-EOF
+                # Use printf to avoid any newline issues
+                printf "deb [signed-by=%s] https://packages.fluentbit.io/%s/%s %s main\n" \
+                    "$KEYRING_FILE" "$REPO_PATH" "$OS_CODENAME" "$OS_CODENAME" > "$SOURCES_FILE"
                 
-                # Verify the file was created correctly
-                if [ -f "$SOURCES_FILE" ] && grep -qE "^deb\s+\[.*\]\s+https://packages\.fluentbit\.io/" "$SOURCES_FILE"; then
-                    success "Fluent Bit repository added"
+                # Verify the file was created correctly and has valid content
+                if [ -f "$SOURCES_FILE" ]; then
+                    # Check file is not empty and has correct format
+                    if [ -s "$SOURCES_FILE" ] && grep -qE "^deb\s+\[.*\]\s+https://packages\.fluentbit\.io/" "$SOURCES_FILE"; then
+                        # Verify no extra whitespace or issues
+                        FILE_CONTENT=$(cat "$SOURCES_FILE" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                        if [ -n "$FILE_CONTENT" ] && echo "$FILE_CONTENT" | grep -qE "^deb\s+\[.*\]\s+https://packages\.fluentbit\.io/"; then
+                            success "Fluent Bit repository added"
+                        else
+                            error "Repository file created but content is invalid"
+                            rm -f "$SOURCES_FILE"
+                            exit 1
+                        fi
+                    else
+                        error "Repository file is empty or has invalid format"
+                        rm -f "$SOURCES_FILE"
+                        exit 1
+                    fi
                 else
-                    error "Failed to create valid repository file"
-                    rm -f "$SOURCES_FILE"
+                    error "Failed to create repository file"
                     exit 1
                 fi
             else
@@ -1393,13 +1417,15 @@ EOF
         if ! is_package_installed fluent-bit; then
             # Test repository configuration before installing
             info "Testing repository configuration..."
-            if apt-get update -qq 2>&1 | grep -qi "fluent\|error\|unknown"; then
+            # Run apt-get update and capture any errors
+            UPDATE_OUTPUT=$(apt-get update -qq 2>&1 || true)
+            if echo "$UPDATE_OUTPUT" | grep -qiE "fluent.*unknown|fluent.*not known|fluent.*error|E:"; then
                 warn "Repository test found issues, attempting to fix..."
                 # Remove and recreate if there's an error
                 rm -f "$SOURCES_FILE"
-                cat > "$SOURCES_FILE" <<EOF
-deb [signed-by=${KEYRING_FILE}] https://packages.fluentbit.io/${REPO_PATH}/${OS_CODENAME} ${OS_CODENAME} main
-EOF
+                printf "deb [signed-by=%s] https://packages.fluentbit.io/%s/%s %s main\n" \
+                    "$KEYRING_FILE" "$REPO_PATH" "$OS_CODENAME" "$OS_CODENAME" > "$SOURCES_FILE"
+                info "Repository file recreated, retrying update..."
             fi
             
             run_or_die apt-get update -qq
