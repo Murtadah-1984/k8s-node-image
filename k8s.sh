@@ -1333,24 +1333,49 @@ EOF
         mkdir -p /usr/share/keyrings
         mkdir -p /etc/apt/sources.list.d
         
+        # Detect OS type for correct repository path
+        OS_CODENAME=$(lsb_release -cs 2>/dev/null || echo "jammy")
+        if grep -qi ubuntu /etc/os-release 2>/dev/null; then
+            REPO_PATH="ubuntu"
+        else
+            REPO_PATH="debian"
+        fi
+        
         # Check if repository file exists and is valid
         if [ -f /etc/apt/sources.list.d/fluentbit.list ]; then
-            # Validate the file format
-            if grep -q "^deb.*packages.fluentbit.io" /etc/apt/sources.list.d/fluentbit.list 2>/dev/null; then
+            # Validate the file format - check for proper deb line
+            if grep -qE "^deb\s+\[.*\]\s+https://packages\.fluentbit\.io/" /etc/apt/sources.list.d/fluentbit.list 2>/dev/null; then
                 info "Fluent Bit repository already configured, skipping..."
             else
-                warn "Fluent Bit repository file exists but appears malformed, recreating..."
+                warn "Fluent Bit repository file exists but appears malformed, removing..."
                 rm -f /etc/apt/sources.list.d/fluentbit.list
             fi
         fi
         
         if [ ! -f /etc/apt/sources.list.d/fluentbit.list ]; then
             info "Adding Fluent Bit repository..."
+            # Download and add GPG key
             if retry_curl "https://packages.fluentbit.io/fluentbit.key" "/tmp/fluentbit.key"; then
-                gpg --dearmor < /tmp/fluentbit.key > /usr/share/keyrings/fluentbit.gpg
+                gpg --dearmor < /tmp/fluentbit.key > /usr/share/keyrings/fluentbit.gpg 2>/dev/null || {
+                    error "Failed to process GPG key"
+                    rm -f /tmp/fluentbit.key
+                    exit 1
+                }
                 rm -f /tmp/fluentbit.key
-                echo "deb [signed-by=/usr/share/keyrings/fluentbit.gpg] https://packages.fluentbit.io/debian/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/fluentbit.list > /dev/null
-                success "Fluent Bit repository added"
+                
+                # Create repository file with correct format (no trailing newline issues)
+                cat > /etc/apt/sources.list.d/fluentbit.list <<EOF
+deb [signed-by=/usr/share/keyrings/fluentbit.gpg] https://packages.fluentbit.io/${REPO_PATH}/${OS_CODENAME} ${OS_CODENAME} main
+EOF
+                
+                # Verify the file was created correctly
+                if [ -f /etc/apt/sources.list.d/fluentbit.list ] && grep -qE "^deb\s+\[.*\]\s+https://packages\.fluentbit\.io/" /etc/apt/sources.list.d/fluentbit.list; then
+                    success "Fluent Bit repository added"
+                else
+                    error "Failed to create valid repository file"
+                    rm -f /etc/apt/sources.list.d/fluentbit.list
+                    exit 1
+                fi
             else
                 error "Failed to download Fluent Bit GPG key"
                 exit 1
@@ -1359,6 +1384,17 @@ EOF
         
         # Install Fluent Bit
         if ! is_package_installed fluent-bit; then
+            # Test repository configuration before installing
+            info "Testing repository configuration..."
+            if apt-get update -qq 2>&1 | grep -q "fluentbit"; then
+                warn "Repository test found issues, attempting to fix..."
+                # Remove and recreate if there's an error
+                rm -f /etc/apt/sources.list.d/fluentbit.list
+                cat > /etc/apt/sources.list.d/fluentbit.list <<EOF
+deb [signed-by=/usr/share/keyrings/fluentbit.gpg] https://packages.fluentbit.io/${REPO_PATH}/${OS_CODENAME} ${OS_CODENAME} main
+EOF
+            fi
+            
             run_or_die apt-get update -qq
             run_or_die apt-get install -y fluent-bit
         else
