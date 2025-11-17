@@ -208,7 +208,10 @@ main() {
     # Install uuidgen if not available
     if ! command -v uuidgen >/dev/null 2>&1; then
         info "Installing uuid-runtime package..."
-        run_or_die apt-get update -qq
+        apt-get update -qq || {
+            warn "apt-get update failed, trying without -qq..."
+            apt-get update || true
+        }
         run_or_die apt-get install -y uuid-runtime
         success "uuid-runtime installed"
     fi
@@ -800,33 +803,137 @@ EOF
     success "Kubernetes installation completed"
     
     # ----------------------------------------------------------------------
-    # STEP 4b: Pre-load Kubernetes Images
+    # STEP 4b: Pre-load Kubernetes Images (MANDATORY)
     # ----------------------------------------------------------------------
-    step "Pre-loading Kubernetes container images"
+    step "Pre-loading Kubernetes container images (MANDATORY)"
     
-    info "Waiting for containerd to be ready..."
+    info "Checking containerd service status..."
+    if ! systemctl is-active --quiet containerd; then
+        error "containerd service is not active"
+        info "Attempting to start containerd..."
+        run_or_die systemctl start containerd
+        sleep 3
+    fi
+    
+    if ! systemctl is-active --quiet containerd; then
+        error "containerd service failed to start"
+        info "Checking containerd service status:"
+        systemctl status containerd --no-pager -l || true
+        info "Checking containerd logs:"
+        journalctl -u containerd -n 20 --no-pager || true
+        error "containerd must be running to pre-load images"
+        exit 1
+    fi
+    success "containerd service is active"
+    
+    info "Checking containerd socket..."
+    SOCKET_PATH="/run/containerd/containerd.sock"
+    if [ ! -S "$SOCKET_PATH" ]; then
+        error "containerd socket not found at $SOCKET_PATH"
+        info "Checking alternative socket locations..."
+        ls -la /run/containerd/ 2>/dev/null || true
+        ls -la /var/run/containerd/ 2>/dev/null || true
+        error "containerd socket must exist to pre-load images"
+        exit 1
+    fi
+    success "containerd socket found at $SOCKET_PATH"
+    
+    info "Testing containerd connectivity with crictl..."
     timeout=120
     counter=0
     while ! crictl info &>/dev/null && [ $counter -lt $timeout ]; do
+        if [ $((counter % 10)) -eq 0 ] && [ $counter -gt 0 ]; then
+            info "Still waiting for containerd... (${counter}s/${timeout}s)"
+            debug "Testing crictl connection..."
+            crictl info 2>&1 | head -5 || true
+        fi
         sleep 2
         counter=$((counter + 2))
     done
     
-    if crictl info &>/dev/null; then
-        IMAGE_COUNT=0
-        # Use the actual installed version (K8S_PURE_VERSION) for image list
-        # This ensures images match the installed kubeadm version
-        for image in $(kubeadm config images list --kubernetes-version="v${K8S_PURE_VERSION}" 2>/dev/null || kubeadm config images list 2>/dev/null); do
-            info "Pulling: $image"
-            if crictl pull "$image" 2>/dev/null; then
-                IMAGE_COUNT=$((IMAGE_COUNT + 1))
-            fi
-        done
-        if [ $IMAGE_COUNT -gt 0 ]; then
-            success "Pre-loaded ${IMAGE_COUNT} Kubernetes image(s) for version v${K8S_PURE_VERSION}"
-        fi
+    if ! crictl info &>/dev/null; then
+        error "containerd is not responding to crictl commands"
+        info "Diagnostics:"
+        info "  - Service status:"
+        systemctl status containerd --no-pager -l | head -10 || true
+        info "  - Socket permissions:"
+        ls -la "$SOCKET_PATH" || true
+        info "  - crictl info output:"
+        crictl info 2>&1 || true
+        info "  - Recent containerd logs:"
+        journalctl -u containerd -n 30 --no-pager | tail -20 || true
+        error "containerd must be fully operational to pre-load images"
+        exit 1
+    fi
+    
+    CRICTL_INFO=$(crictl info 2>&1)
+    success "containerd is ready and responding"
+    debug "containerd info: $(echo "$CRICTL_INFO" | head -3)"
+    
+    info "Getting list of required Kubernetes images for version v${K8S_PURE_VERSION}..."
+    IMAGE_LIST=""
+    if kubeadm config images list --kubernetes-version="v${K8S_PURE_VERSION}" &>/dev/null; then
+        IMAGE_LIST=$(kubeadm config images list --kubernetes-version="v${K8S_PURE_VERSION}" 2>&1)
+        info "Using kubeadm config images list for version v${K8S_PURE_VERSION}"
+    elif kubeadm config images list &>/dev/null; then
+        IMAGE_LIST=$(kubeadm config images list 2>&1)
+        warn "Using default kubeadm config images list (version-specific failed)"
     else
-        warn "containerd not ready, skipping image pre-load"
+        error "Failed to get Kubernetes image list from kubeadm"
+        error "kubeadm config images list output:"
+        kubeadm config images list 2>&1 || true
+        exit 1
+    fi
+    
+    if [ -z "$IMAGE_LIST" ]; then
+        error "No images found in kubeadm image list"
+        exit 1
+    fi
+    
+    IMAGE_COUNT=0
+    FAILED_IMAGES=()
+    TOTAL_IMAGES=$(echo "$IMAGE_LIST" | grep -v "^$" | wc -l)
+    info "Found ${TOTAL_IMAGES} image(s) to pre-load"
+    
+    for image in $IMAGE_LIST; do
+        if [ -z "$image" ] || [ "$image" = "WARNING:" ]; then
+            continue
+        fi
+        info "[${IMAGE_COUNT}/${TOTAL_IMAGES}] Pulling: $image"
+        if crictl pull "$image" 2>&1; then
+            IMAGE_COUNT=$((IMAGE_COUNT + 1))
+            success "Successfully pulled: $image"
+        else
+            PULL_ERROR=$?
+            error "Failed to pull image: $image (exit code: $PULL_ERROR)"
+            FAILED_IMAGES+=("$image")
+            info "Checking network connectivity..."
+            ping -c 1 8.8.8.8 &>/dev/null || warn "Network connectivity check failed"
+            error "Image pre-loading is MANDATORY - cannot continue with failed images"
+            exit 1
+        fi
+    done
+    
+    if [ $IMAGE_COUNT -eq 0 ]; then
+        error "No images were successfully pre-loaded"
+        exit 1
+    fi
+    
+    if [ ${#FAILED_IMAGES[@]} -gt 0 ]; then
+        error "Failed to pre-load ${#FAILED_IMAGES[@]} image(s):"
+        for failed_image in "${FAILED_IMAGES[@]}"; do
+            error "  - $failed_image"
+        done
+        exit 1
+    fi
+    
+    success "Successfully pre-loaded ${IMAGE_COUNT} Kubernetes image(s) for version v${K8S_PURE_VERSION}"
+    info "Verifying images are available..."
+    VERIFIED_COUNT=$(crictl images 2>/dev/null | grep -c "k8s.gcr.io\|registry.k8s.io" || echo "0")
+    if [ "$VERIFIED_COUNT" -gt 0 ]; then
+        success "Verified ${VERIFIED_COUNT} Kubernetes image(s) in containerd storage"
+    else
+        warn "Could not verify images in containerd storage (this may be normal)"
     fi
     
     # ----------------------------------------------------------------------
@@ -913,9 +1020,10 @@ log measurements statistics tracking
 EOF
     
     systemctl daemon-reload
-    systemctl enable chronyd
-    systemctl start chronyd
-    success "chronyd service enabled and started"
+    # On Ubuntu, the service is 'chrony', not 'chronyd'
+    systemctl enable chrony
+    systemctl start chrony
+    success "chrony service enabled and started"
     
     # 5.3: Node Exporter (Metrics)
     step "Installing Prometheus node_exporter ${NODE_EXPORTER_VERSION}"
