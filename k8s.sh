@@ -1330,50 +1330,57 @@ EOF
         fi
         
         # Add Fluent Bit repository (only if not already configured)
+        # Following official documentation: https://docs.fluentbit.io/manual/installation/downloads/linux/debian
         mkdir -p /usr/share/keyrings
         mkdir -p /etc/apt/sources.list.d
         
+        # Get codename (official method from Fluent Bit docs)
+        OS_CODENAME=$(grep -oP '(?<=VERSION_CODENAME=).*' /etc/os-release 2>/dev/null || lsb_release -cs 2>/dev/null || echo "jammy")
+        
         # Detect OS type for correct repository path
-        OS_CODENAME=$(lsb_release -cs 2>/dev/null || echo "jammy")
         if grep -qi ubuntu /etc/os-release 2>/dev/null; then
             REPO_PATH="ubuntu"
         else
             REPO_PATH="debian"
         fi
         
+        # Official keyring filename from Fluent Bit docs
+        KEYRING_FILE="/usr/share/keyrings/fluentbit-keyring.gpg"
+        SOURCES_FILE="/etc/apt/sources.list.d/fluent-bit.list"
+        
         # Check if repository file exists and is valid
-        if [ -f /etc/apt/sources.list.d/fluentbit.list ]; then
+        if [ -f "$SOURCES_FILE" ]; then
             # Validate the file format - check for proper deb line
-            if grep -qE "^deb\s+\[.*\]\s+https://packages\.fluentbit\.io/" /etc/apt/sources.list.d/fluentbit.list 2>/dev/null; then
+            if grep -qE "^deb\s+\[.*\]\s+https://packages\.fluentbit\.io/" "$SOURCES_FILE" 2>/dev/null; then
                 info "Fluent Bit repository already configured, skipping..."
             else
                 warn "Fluent Bit repository file exists but appears malformed, removing..."
-                rm -f /etc/apt/sources.list.d/fluentbit.list
+                rm -f "$SOURCES_FILE"
             fi
         fi
         
-        if [ ! -f /etc/apt/sources.list.d/fluentbit.list ]; then
+        if [ ! -f "$SOURCES_FILE" ]; then
             info "Adding Fluent Bit repository..."
-            # Download and add GPG key
+            # Download and add GPG key (official method from Fluent Bit docs)
             if retry_curl "https://packages.fluentbit.io/fluentbit.key" "/tmp/fluentbit.key"; then
-                gpg --dearmor < /tmp/fluentbit.key > /usr/share/keyrings/fluentbit.gpg 2>/dev/null || {
+                gpg --dearmor < /tmp/fluentbit.key > "$KEYRING_FILE" 2>/dev/null || {
                     error "Failed to process GPG key"
                     rm -f /tmp/fluentbit.key
                     exit 1
                 }
                 rm -f /tmp/fluentbit.key
                 
-                # Create repository file with correct format (no trailing newline issues)
-                cat > /etc/apt/sources.list.d/fluentbit.list <<EOF
-deb [signed-by=/usr/share/keyrings/fluentbit.gpg] https://packages.fluentbit.io/${REPO_PATH}/${OS_CODENAME} ${OS_CODENAME} main
+                # Create repository file with correct format (official format from Fluent Bit docs)
+                cat > "$SOURCES_FILE" <<EOF
+deb [signed-by=${KEYRING_FILE}] https://packages.fluentbit.io/${REPO_PATH}/${OS_CODENAME} ${OS_CODENAME} main
 EOF
                 
                 # Verify the file was created correctly
-                if [ -f /etc/apt/sources.list.d/fluentbit.list ] && grep -qE "^deb\s+\[.*\]\s+https://packages\.fluentbit\.io/" /etc/apt/sources.list.d/fluentbit.list; then
+                if [ -f "$SOURCES_FILE" ] && grep -qE "^deb\s+\[.*\]\s+https://packages\.fluentbit\.io/" "$SOURCES_FILE"; then
                     success "Fluent Bit repository added"
                 else
                     error "Failed to create valid repository file"
-                    rm -f /etc/apt/sources.list.d/fluentbit.list
+                    rm -f "$SOURCES_FILE"
                     exit 1
                 fi
             else
@@ -1386,12 +1393,12 @@ EOF
         if ! is_package_installed fluent-bit; then
             # Test repository configuration before installing
             info "Testing repository configuration..."
-            if apt-get update -qq 2>&1 | grep -q "fluentbit"; then
+            if apt-get update -qq 2>&1 | grep -qi "fluent\|error\|unknown"; then
                 warn "Repository test found issues, attempting to fix..."
                 # Remove and recreate if there's an error
-                rm -f /etc/apt/sources.list.d/fluentbit.list
-                cat > /etc/apt/sources.list.d/fluentbit.list <<EOF
-deb [signed-by=/usr/share/keyrings/fluentbit.gpg] https://packages.fluentbit.io/${REPO_PATH}/${OS_CODENAME} ${OS_CODENAME} main
+                rm -f "$SOURCES_FILE"
+                cat > "$SOURCES_FILE" <<EOF
+deb [signed-by=${KEYRING_FILE}] https://packages.fluentbit.io/${REPO_PATH}/${OS_CODENAME} ${OS_CODENAME} main
 EOF
             fi
             
