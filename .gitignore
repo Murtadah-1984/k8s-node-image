@@ -1,0 +1,4 @@
+# Ignore everything except k8s.sh
+*
+!.gitignore
+!k8s.sh

@@ -1,0 +1,1141 @@
+#!/usr/bin/env bash
+# -------------------------------------------------------------------
+# Script: k8s.sh
+# Version: 4.3.0
+# Description: Standalone Kubernetes node provisioning script for bare metal
+#              Complete bootstrap script with all provisioning steps
+#              Includes: hardening, kernel config, containerd, kubernetes, monitoring
+#              
+#              Usage: sudo bash k8s.sh
+#              
+#              Security: CIS Benchmark Level 1 inspired baseline
+#              - Implements many CIS L1 controls (SSH, kernel, file permissions, audit)
+#              - Not a full CIS benchmark implementation (see note below)
+#              
+#              Improvements in v4.3.0:
+#              - Added root check enforcement (prevents partial runs)
+#              - Improved Kubernetes version detection (supports minor version like 1.28)
+#              - Fixed image preloading to use actual installed version
+#              - Better version matching between kubeadm and container images
+#              
+#              Improvements in v4.2.0:
+#              - Auto-detect Kubernetes version from repository (future-proof)
+#              - Registry mirrors always configured (not just when CRI block missing)
+#              - journald.conf uses drop-in directory (upgrade-safe)
+#              - Improved cleanup function with comprehensive temp file patterns
+#              - Enhanced reboot message with clear instructions
+#              
+#              Improvements in v4.1.0:
+#              - Fixed sysctl file overwrite (separate CIS and kernel files)
+#              - Fixed CRICTL download URL (keeps "v" prefix)
+#              - Added firewall rules for monitoring ports
+#              - Improved log cleanup (preserves Kubernetes logs)
+#              - Added swap.target masking
+#              - Added retry mechanism for network operations
+#              - Added OS version check and cloud-init wait
+#              - Enhanced SSH hardening
+#              - Added containerd registry mirrors
+#              - Added Kubernetes version verification
+#              - Improved node uniqueness script with deterministic ID
+# -------------------------------------------------------------------
+
+# ============================================================================
+# STRICT MODE & SAFETY
+# ============================================================================
+set -euo pipefail
+IFS=$'\n\t'
+
+# ============================================================================
+# GLOBAL CONFIGURATION
+# ============================================================================
+SCRIPT_NAME=$(basename "$0")
+LOGFILE="/var/log/k8s-node-bootstrap.log"
+DEBUG=${DEBUG:-0}
+
+# ============================================================================
+# VERSION CONFIGURATION (All versions in one place for easy maintenance)
+# ============================================================================
+# KUBERNETES_VERSION: Set to minor version (e.g., 1.28) to auto-select latest patch
+#                     Or set to full version (e.g., 1.28.0) for specific patch
+KUBERNETES_VERSION="${KUBERNETES_VERSION:-1.28}"
+CONTAINERD_VERSION="${CONTAINERD_VERSION:-1.7.0}"
+CNI_VERSION="${CNI_VERSION:-v1.3.0}"
+CRICTL_VERSION="${CRICTL_VERSION:-v1.28.0}"
+NODE_EXPORTER_VERSION="1.7.0"
+FLUENT_BIT_VERSION="2.2.0"
+NODE_HOSTNAME="${NODE_HOSTNAME:-k8s-node}"
+TIMEZONE="${TIMEZONE:-Asia/Baghdad}"
+
+# ============================================================================
+# COLOR FUNCTIONS
+# ============================================================================
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+BLUE="\e[34m"
+MAGENTA="\e[35m"
+CYAN="\e[36m"
+BOLD="\e[1m"
+RESET="\e[0m"
+
+info()    { echo -e "${BLUE}[INFO]${RESET} $*"; }
+success() { echo -e "${GREEN}[OK]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${RESET} $*"; }
+error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
+debug()   { [ "$DEBUG" = "1" ] && echo -e "${MAGENTA}[DEBUG]${RESET} $*"; }
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+step() {
+    echo -e "\n${BOLD}${CYAN}🚀 $*${RESET}"
+}
+
+run_or_die() {
+    debug "Running: $*"
+    if ! "$@"; then
+        error "Failed: $*"
+        exit 1
+    fi
+}
+
+check_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        debug "$1 not found"
+        return 1
+    fi
+    return 0
+}
+
+# Retry function for network operations (useful for slow connections)
+retry_curl() {
+    local url="$1"
+    local output="$2"
+    local max_attempts=3
+    local attempt=1
+    
+    while [ $attempt -le $max_attempts ]; do
+        if curl -fsSL "$url" -o "$output" 2>/dev/null; then
+            return 0
+        fi
+        warn "Attempt $attempt/$max_attempts failed for $url, retrying..."
+        sleep $((attempt * 2))
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+# Cleanup function for temporary files
+cleanup() {
+    debug "Cleaning up temporary files..."
+    # Collect all temp file patterns
+    rm -f /tmp/cni-plugins.tgz \
+          /tmp/crictl.tar.gz \
+          /tmp/crictl-*.tar.gz \
+          /tmp/node_exporter-*.tar.gz \
+          /tmp/node_exporter-*.linux-amd64.tar.gz \
+          /tmp/k8s-key.gpg \
+          /tmp/EMPTY 2>/dev/null || true
+}
+
+# ============================================================================
+# ERROR HANDLING
+# ============================================================================
+trap 'error "Script failed at line $LINENO: $BASH_COMMAND"; cleanup' ERR
+trap 'cleanup' EXIT
+
+# ============================================================================
+# MAIN SCRIPT
+# ============================================================================
+main() {
+    # Root check (must be first)
+    if [ "$EUID" -ne 0 ]; then
+        echo "This script must be run as root (use sudo)." >&2
+        exit 1
+    fi
+    
+    echo "============================================================"
+    echo "   K8S NODE BOOTSTRAP - STARTING"
+    echo "============================================================"
+    
+    # Setup logging
+    mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
+    exec > >(tee -a "$LOGFILE") 2>&1
+    
+    # ----------------------------------------------------------------------
+    # 0. System Verification and Preflight Checks
+    # ----------------------------------------------------------------------
+    step "Verifying system environment..."
+    if [ ! -d /etc/systemd/system ]; then
+        error "This does not look like an installed system. Aborting."
+        exit 1
+    fi
+    
+    if ! systemctl is-system-running >/dev/null 2>&1; then
+        warn "Systemd may not be fully initialized, but continuing..."
+    fi
+    
+    # Check OS version
+    if [ -f /etc/os-release ]; then
+        source /etc/os-release
+        if [[ "$VERSION_ID" != "22.04" ]]; then
+            warn "This script is optimized for Ubuntu 22.04. Detected: $VERSION_ID"
+        else
+            info "Ubuntu 22.04 detected - optimal version"
+        fi
+    fi
+    
+    # Wait for cloud-init if present (common on bare metal servers)
+    if command -v cloud-init >/dev/null 2>&1; then
+        info "Waiting for cloud-init to complete (if running)..."
+        cloud-init status --wait 2>/dev/null || true
+    fi
+    
+    success "System environment verified"
+    
+    # Load environment variables from /etc/environment if available
+    if [ -f /etc/environment ]; then
+        set -a
+        source /etc/environment 2>/dev/null || true
+        set +a
+    fi
+    
+    # ----------------------------------------------------------------------
+    # STEP 0: Unique Identifiers
+    # ----------------------------------------------------------------------
+    step "Creating node uniqueness verification script"
+    
+    # Install uuidgen if not available
+    if ! command -v uuidgen >/dev/null 2>&1; then
+        info "Installing uuid-runtime package..."
+        run_or_die apt-get update -qq
+        run_or_die apt-get install -y uuid-runtime
+        success "uuid-runtime installed"
+    fi
+    
+    # Create verification script
+    info "Creating node uniqueness verification script..."
+    mkdir -p /usr/local/bin
+    cat > /usr/local/bin/verify-node-uniqueness.sh <<'VERIFY_EOF'
+#!/bin/bash
+# Script to verify node uniqueness for Kubernetes
+# This script runs at runtime
+
+echo "=== Node Uniqueness Verification ==="
+echo ""
+
+# Check product_uuid
+PRODUCT_UUID=""
+if [ -f /sys/class/dmi/id/product_uuid ]; then
+    PRODUCT_UUID=$(cat /sys/class/dmi/id/product_uuid | tr -d '[:space:]')
+    echo "Product UUID: $PRODUCT_UUID"
+    
+    if [ -z "$PRODUCT_UUID" ] || [ "$PRODUCT_UUID" = "00000000-0000-0000-0000-000000000000" ]; then
+        echo "  ⚠️  WARNING: Invalid or default product_uuid detected!"
+        echo "  This may cause Kubernetes node identification issues."
+    else
+        echo "  ✅ Product UUID is valid"
+    fi
+else
+    echo "  ⚠️  WARNING: product_uuid file not found!"
+fi
+
+echo ""
+
+# Check MAC addresses and generate deterministic node ID
+echo "Network Interface MAC Addresses:"
+FIRST_MAC=""
+if command -v ip >/dev/null 2>&1; then
+    INTERFACES=$(ip link show | grep -E '^[0-9]+:' | awk -F': ' '{print $2}' | grep -v '^lo$')
+    
+    MAC_COUNT=0
+    for iface in $INTERFACES; do
+        MAC=$(ip link show "$iface" 2>/dev/null | grep -oP 'link/ether \K[0-9a-f:]+' || echo "")
+        if [ -n "$MAC" ]; then
+            MAC_COUNT=$((MAC_COUNT + 1))
+            echo "  $iface: $MAC"
+            if [ -z "$FIRST_MAC" ]; then
+                FIRST_MAC="$MAC"
+            fi
+        fi
+    done
+    
+    if [ $MAC_COUNT -eq 0 ]; then
+        echo "  ⚠️  WARNING: No MAC addresses found!"
+    else
+        echo "  ✅ Found $MAC_COUNT network interface(s)"
+    fi
+    
+    # Generate deterministic node ID
+    if [ -n "$PRODUCT_UUID" ] && [ -n "$FIRST_MAC" ]; then
+        NODE_ID=$(echo -n "${PRODUCT_UUID}-${FIRST_MAC}" | sha256sum | cut -d' ' -f1 | cut -c1-16)
+        echo ""
+        echo "Node ID (deterministic): $NODE_ID"
+    fi
+else
+    echo "  ⚠️  WARNING: 'ip' command not found!"
+fi
+
+echo ""
+echo "=== Verification Complete ==="
+VERIFY_EOF
+    
+    run_or_die chmod +x /usr/local/bin/verify-node-uniqueness.sh
+    success "Node uniqueness verification script installed"
+    
+    # ----------------------------------------------------------------------
+    # STEP 1: System Hardening (CIS Benchmark Level 1)
+    # ----------------------------------------------------------------------
+    step "Starting system hardening (CIS Benchmark Level 1)"
+    
+    # Update system
+    step "Updating system packages..."
+    run_or_die apt-get update -qq
+    run_or_die apt-get upgrade -y
+    
+    # Install security tools
+    step "Installing security tools and networking utilities..."
+    run_or_die apt-get install -y \
+      ufw \
+      fail2ban \
+      unattended-upgrades \
+      apt-listchanges \
+      iptables \
+      iproute2 \
+      net-tools
+    
+    # Configure firewall (UFW)
+    step "Configuring firewall (UFW)..."
+    ufw --force enable || true
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow ssh
+    ufw allow 10250/tcp comment 'Kubelet API'
+    ufw allow 10256/tcp comment 'kube-proxy'
+    ufw allow 30000:32767/tcp comment 'NodePort Services'
+    ufw allow 30000:32767/udp comment 'NodePort Services'
+    ufw allow 9100/tcp comment 'Node Exporter (Prometheus)'
+    ufw allow 24224/tcp comment 'Fluent Bit forward'
+    success "Firewall configured"
+    
+    # Configure automatic security updates
+    step "Configuring automatic security updates..."
+    cat > /etc/apt/apt.conf.d/50unattended-upgrades <<EOF
+Unattended-Upgrade::Allowed-Origins {
+    "\${distro_id}:\${distro_codename}-security";
+    "\${distro_id}ESMApps:\${distro_codename}-apps-security";
+    "\${distro_id}ESM:\${distro_codename}-infra-security";
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+EOF
+    success "Automatic security updates configured"
+    
+    # CIS Benchmark: SSH Hardening
+    step "Configuring SSH security (CIS Benchmark Level 1)..."
+    if [ -f /etc/ssh/sshd_config ]; then
+        cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak 2>/dev/null || true
+        
+        sed -i 's/#PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
+        sed -i 's/PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
+        sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+        sed -i 's/^#HostbasedAuthentication.*/HostbasedAuthentication no/' /etc/ssh/sshd_config
+        sed -i 's/^HostbasedAuthentication.*/HostbasedAuthentication no/' /etc/ssh/sshd_config
+        sed -i 's/^#PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
+        sed -i 's/^PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
+        sed -i 's/^#PermitUserEnvironment.*/PermitUserEnvironment no/' /etc/ssh/sshd_config
+        sed -i 's/^PermitUserEnvironment.*/PermitUserEnvironment no/' /etc/ssh/sshd_config
+        
+        if ! grep -q "^MaxAuthTries" /etc/ssh/sshd_config; then
+            echo "MaxAuthTries 4" >> /etc/ssh/sshd_config
+        else
+            sed -i 's/^#MaxAuthTries.*/MaxAuthTries 4/' /etc/ssh/sshd_config
+            sed -i 's/^MaxAuthTries.*/MaxAuthTries 4/' /etc/ssh/sshd_config
+        fi
+        
+        sed -i 's/^#IgnoreRhosts.*/IgnoreRhosts yes/' /etc/ssh/sshd_config
+        sed -i 's/^IgnoreRhosts.*/IgnoreRhosts yes/' /etc/ssh/sshd_config
+        sed -i 's/^#Protocol.*/Protocol 2/' /etc/ssh/sshd_config
+        sed -i 's/^Protocol.*/Protocol 2/' /etc/ssh/sshd_config
+        sed -i 's/^#X11Forwarding.*/X11Forwarding no/' /etc/ssh/sshd_config
+        sed -i 's/^X11Forwarding.*/X11Forwarding no/' /etc/ssh/sshd_config
+        
+        # Additional SSH hardening
+        if ! grep -q "^AllowTcpForwarding" /etc/ssh/sshd_config; then
+            echo "AllowTcpForwarding no" >> /etc/ssh/sshd_config
+        else
+            sed -i 's/^#AllowTcpForwarding.*/AllowTcpForwarding no/' /etc/ssh/sshd_config
+            sed -i 's/^AllowTcpForwarding.*/AllowTcpForwarding no/' /etc/ssh/sshd_config
+        fi
+        
+        if ! grep -q "^ClientAliveInterval" /etc/ssh/sshd_config; then
+            echo "ClientAliveInterval 300" >> /etc/ssh/sshd_config
+        else
+            sed -i 's/^#ClientAliveInterval.*/ClientAliveInterval 300/' /etc/ssh/sshd_config
+            sed -i 's/^ClientAliveInterval.*/ClientAliveInterval 300/' /etc/ssh/sshd_config
+        fi
+        
+        if ! grep -q "^ClientAliveCountMax" /etc/ssh/sshd_config; then
+            echo "ClientAliveCountMax 2" >> /etc/ssh/sshd_config
+        else
+            sed -i 's/^#ClientAliveCountMax.*/ClientAliveCountMax 2/' /etc/ssh/sshd_config
+            sed -i 's/^ClientAliveCountMax.*/ClientAliveCountMax 2/' /etc/ssh/sshd_config
+        fi
+        
+        if ! grep -q "^MaxStartups" /etc/ssh/sshd_config; then
+            echo "MaxStartups 10:30:60" >> /etc/ssh/sshd_config
+        else
+            sed -i 's/^#MaxStartups.*/MaxStartups 10:30:60/' /etc/ssh/sshd_config
+            sed -i 's/^MaxStartups.*/MaxStartups 10:30:60/' /etc/ssh/sshd_config
+        fi
+        
+        if ! grep -q "^MaxSessions" /etc/ssh/sshd_config; then
+            echo "MaxSessions 10" >> /etc/ssh/sshd_config
+        else
+            sed -i 's/^#MaxSessions.*/MaxSessions 10/' /etc/ssh/sshd_config
+            sed -i 's/^MaxSessions.*/MaxSessions 10/' /etc/ssh/sshd_config
+        fi
+        
+        chmod 600 /etc/ssh/sshd_config
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+        success "SSH security configured"
+    fi
+    
+    # CIS Benchmark: Kernel Parameters (separate file to avoid overwrite)
+    step "Configuring kernel security parameters..."
+    cat > /etc/sysctl.d/k8s-cis.conf <<EOF
+
+# CIS Benchmark: Network Security
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+EOF
+    run_or_die sysctl --system
+    success "Kernel security parameters configured"
+    
+    # CIS Benchmark: File Permissions
+    step "Setting secure file permissions..."
+    chmod 644 /etc/passwd 2>/dev/null || true
+    chmod 640 /etc/shadow 2>/dev/null || true
+    chmod 644 /etc/group 2>/dev/null || true
+    chmod 640 /etc/gshadow 2>/dev/null || true
+    success "File permissions configured"
+    
+    # CIS Benchmark: Disable unnecessary services
+    step "Disabling unnecessary services..."
+    systemctl stop snapd 2>/dev/null || true
+    systemctl disable snapd 2>/dev/null || true
+    systemctl stop bluetooth 2>/dev/null || true
+    systemctl disable bluetooth 2>/dev/null || true
+    systemctl stop avahi-daemon 2>/dev/null || true
+    systemctl disable avahi-daemon 2>/dev/null || true
+    success "Unnecessary services disabled"
+    
+    # CIS Benchmark: Configure audit logging
+    step "Configuring audit logging..."
+    if ! check_command auditd; then
+        run_or_die apt-get install -y auditd audispd-plugins
+    fi
+    systemctl enable auditd
+    systemctl start auditd 2>/dev/null || true
+    success "Audit logging installed and enabled"
+    
+    # Configure hostname
+    step "Configuring system hostname..."
+    hostnamectl set-hostname "${NODE_HOSTNAME}" 2>/dev/null || echo "${NODE_HOSTNAME}" > /etc/hostname
+    if [ -f /etc/hosts ]; then
+        if ! grep -q "127.0.1.1.*${NODE_HOSTNAME}" /etc/hosts 2>/dev/null; then
+            sed -i '/^127.0.1.1/d' /etc/hosts
+            echo "127.0.1.1 ${NODE_HOSTNAME}" >> /etc/hosts
+        fi
+    fi
+    success "Hostname configured: ${NODE_HOSTNAME}"
+    
+    # Configure timezone
+    step "Setting system timezone..."
+    timedatectl set-timezone "${TIMEZONE}" 2>/dev/null || {
+        echo "${TIMEZONE}" > /etc/timezone
+        ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime 2>/dev/null || true
+    }
+    success "Timezone set to ${TIMEZONE}"
+    
+    success "System hardening completed"
+    
+    # ----------------------------------------------------------------------
+    # STEP 2: Kernel Configuration for Kubernetes
+    # ----------------------------------------------------------------------
+    step "Configuring kernel parameters for Kubernetes"
+    
+    # Load required kernel modules
+    step "Loading kernel modules..."
+    run_or_die modprobe overlay
+    run_or_die modprobe br_netfilter
+    success "Kernel modules loaded"
+    
+    # Configure kernel modules to load on boot
+    step "Configuring kernel modules to load on boot..."
+    cat > /etc/modules-load.d/k8s.conf <<EOF
+# Kernel modules required for Kubernetes
+overlay
+br_netfilter
+EOF
+    success "Kernel modules configured to load on boot"
+    
+    # Configure sysctl parameters for Kubernetes (separate file)
+    step "Configuring sysctl parameters for Kubernetes..."
+    cat > /etc/sysctl.d/k8s-kernel.conf <<EOF
+# sysctl params required by Kubernetes setup
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+    run_or_die sysctl --system
+    success "Sysctl parameters configured and applied"
+    
+    # Disable swap
+    step "Disabling swap (Kubernetes requirement)..."
+    swapoff -a || true
+    if [ -f /etc/fstab ]; then
+        cp /etc/fstab /etc/fstab.bak 2>/dev/null || true
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+        sed -i '/^[^#].*swap/s/^/#/' /etc/fstab
+    fi
+    
+    # Disable swap via systemd
+    mkdir -p /etc/systemd/system/swap.target.d
+    cat > /etc/systemd/system/swap.target.d/override.conf <<EOF
+[Unit]
+ConditionPathExists=
+[Install]
+WantedBy=
+EOF
+    
+    # Mask swap.target (best practice)
+    systemctl mask swap.target 2>/dev/null || true
+    
+    if [ -f /lib/systemd/system/systemd-swap.service ] || [ -f /usr/lib/systemd/system/systemd-swap.service ]; then
+        systemctl stop systemd-swap 2>/dev/null || true
+        systemctl disable systemd-swap 2>/dev/null || true
+        mkdir -p /etc/systemd/system/systemd-swap.service.d
+        cat > /etc/systemd/system/systemd-swap.service.d/override.conf <<EOF
+[Unit]
+ConditionPathExists=
+[Install]
+WantedBy=
+EOF
+    fi
+    
+    if swapon --show | grep -q .; then
+        warn "Some swap devices are still active"
+    else
+        success "All swap devices disabled"
+    fi
+    
+    success "Kernel configuration completed"
+    
+    # ----------------------------------------------------------------------
+    # STEP 3: Containerd Installation
+    # ----------------------------------------------------------------------
+    step "Installing containerd ${CONTAINERD_VERSION}"
+    
+    # Install dependencies
+    step "Installing containerd dependencies..."
+    run_or_die apt-get update -qq
+    run_or_die apt-get install -y ca-certificates curl gnupg lsb-release jq
+    
+    # Setup Docker repository
+    step "Setting up Docker repository for containerd.io package..."
+    run_or_die mkdir -p /etc/apt/keyrings
+    run_or_die curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+    
+    run_or_die apt-get update -qq
+    run_or_die apt-get install -y containerd.io
+    
+    # Verify installation
+    step "Verifying containerd installation..."
+    if ! check_command containerd; then
+        error "containerd binary not found!"
+        exit 1
+    fi
+    if ! check_command runc; then
+        error "runc binary not found!"
+        exit 1
+    fi
+    success "containerd and runc verified"
+    
+    # Configure containerd
+    step "Configuring containerd..."
+    run_or_die mkdir -p /etc/containerd
+    
+    if [ ! -f /etc/containerd/config.toml ]; then
+        if timeout 5 containerd config default > /etc/containerd/config.toml 2>/dev/null; then
+            success "Default containerd configuration generated"
+        else
+            cat > /etc/containerd/config.toml <<'EOF'
+version = 2
+root = "/var/lib/containerd"
+state = "/run/containerd"
+
+[grpc]
+  address = "/run/containerd/containerd.sock"
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+    SystemdCgroup = true
+EOF
+            success "Minimal containerd configuration created"
+        fi
+    fi
+    
+    # Ensure CRI plugin is enabled
+    step "Ensuring CRI plugin is enabled..."
+    if [ -f /etc/containerd/config.toml ] && grep -q "disabled_plugins" /etc/containerd/config.toml; then
+        if grep -A 10 "disabled_plugins" /etc/containerd/config.toml | grep -q '"cri"'; then
+            sed -i '/disabled_plugins/,/\]/ {
+                s/"cri"//g
+                s/'\''cri'\''//g
+                s/,\s*,/,/g
+                s/\[\s*,/[/g
+                s/,\s*\]/]/g
+            }' /etc/containerd/config.toml
+            success "Removed 'cri' from disabled_plugins list"
+        fi
+    fi
+    
+    # Configure systemd cgroup driver
+    step "Configuring systemd cgroup driver..."
+    if [ -f /etc/containerd/config.toml ] && grep -q '\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]' /etc/containerd/config.toml; then
+        sed -i '/\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]/,/^\[/ {
+            s/SystemdCgroup = false/SystemdCgroup = true/
+        }' /etc/containerd/config.toml
+    else
+        cat >> /etc/containerd/config.toml <<'EOF'
+
+# Systemd cgroup driver configuration for Kubernetes
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+    SystemdCgroup = true
+EOF
+    fi
+    success "SystemdCgroup driver enabled"
+    
+    # Configure registry mirrors (always append if missing)
+    step "Configuring containerd registry mirrors..."
+    if [ -f /etc/containerd/config.toml ] && ! grep -q '\[plugins\."io\.containerd\.grpc\.v1\.cri"\.registry\.mirrors\."docker\.io"\]' /etc/containerd/config.toml; then
+        cat >> /etc/containerd/config.toml <<'EOF'
+
+# Registry mirrors for faster image pulls
+[plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+  endpoint = ["https://registry-1.docker.io"]
+EOF
+        success "Registry mirrors configured"
+    else
+        info "Registry mirrors already configured"
+    fi
+    
+    # Enable and start containerd
+    step "Enabling and starting containerd service..."
+    systemctl daemon-reload
+    systemctl enable containerd
+    systemctl start containerd
+    success "containerd service enabled and started"
+    
+    # Install CNI plugins
+    step "Installing CNI plugins ${CNI_VERSION}..."
+    mkdir -p /opt/cni/bin
+    CNI_URL="https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-amd64-${CNI_VERSION}.tgz"
+    TMP_CNI="/tmp/cni-plugins.tgz"
+    
+    if retry_curl "$CNI_URL" "$TMP_CNI"; then
+        if tar -tzf "$TMP_CNI" >/dev/null 2>&1; then
+            tar -xzf "$TMP_CNI" -C /opt/cni/bin
+            rm -f "$TMP_CNI"
+            success "CNI plugins installed"
+        else
+            warn "CNI archive is not valid"
+            rm -f "$TMP_CNI"
+        fi
+    else
+        warn "Failed to download CNI plugins"
+    fi
+    
+    success "Containerd installation completed"
+    
+    # ----------------------------------------------------------------------
+    # STEP 4: Kubernetes Installation
+    # ----------------------------------------------------------------------
+    step "Installing Kubernetes ${KUBERNETES_VERSION}"
+    
+    K8S_MINOR_VERSION=$(echo "$KUBERNETES_VERSION" | cut -d. -f1,2)
+    K8S_REPO_VERSION="v${K8S_MINOR_VERSION}"
+    
+    # Install prerequisites
+    step "Installing prerequisites for Kubernetes repository..."
+    run_or_die apt-get update -qq
+    run_or_die apt-get install -y apt-transport-https ca-certificates curl gpg
+    
+    # Add Kubernetes repository
+    step "Adding Kubernetes ${K8S_REPO_VERSION} repository..."
+    run_or_die mkdir -p -m 755 /etc/apt/keyrings
+    if ! retry_curl "https://pkgs.k8s.io/core:/stable:/${K8S_REPO_VERSION}/deb/Release.key" "/tmp/k8s-key.gpg"; then
+        error "Failed to download Kubernetes repository key"
+        exit 1
+    fi
+    gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg < /tmp/k8s-key.gpg
+    rm -f /tmp/k8s-key.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${K8S_REPO_VERSION}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+    
+    run_or_die apt-get update -qq
+    
+    # Auto-detect exact Kubernetes version from repository
+    # Supports minor version (e.g., 1.28) to pick latest patch, or full version (e.g., 1.28.0)
+    step "Detecting available Kubernetes version..."
+    
+    # If KUBERNETES_VERSION is minor (e.g., 1.28), match any patch version
+    # If it's full (e.g., 1.28.0), match exact version
+    if [[ "$KUBERNETES_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        # Minor version - match any patch (e.g., 1.28 matches 1.28.0, 1.28.1, etc.)
+        AVAILABLE_VERSION=$(apt-cache madison kubeadm | awk '{print $3}' | grep "^${KUBERNETES_VERSION}\." | head -n 1)
+        info "Minor version specified (${KUBERNETES_VERSION}), selecting latest patch"
+    else
+        # Full version specified - match exact
+        AVAILABLE_VERSION=$(apt-cache madison kubeadm | awk '{print $3}' | grep "^${KUBERNETES_VERSION}" | head -n 1)
+        info "Full version specified (${KUBERNETES_VERSION})"
+    fi
+    
+    if [ -z "$AVAILABLE_VERSION" ]; then
+        error "Kubernetes version ${KUBERNETES_VERSION} not found in repository"
+        info "Available versions:"
+        apt-cache madison kubeadm | head -10 || true
+        error "Please set KUBERNETES_VERSION to an available version (minor like 1.28 or full like 1.28.0)"
+        exit 1
+    fi
+    
+    info "Found version: ${AVAILABLE_VERSION}"
+    
+    # Store pure version (strip Debian suffix) for image preloading
+    K8S_PURE_VERSION="${AVAILABLE_VERSION%%-*}"
+    info "Pure version for images: ${K8S_PURE_VERSION}"
+    
+    # Install Kubernetes components with auto-detected version
+    step "Installing kubectl, kubelet, and kubeadm..."
+    run_or_die apt-get install -y \
+      kubectl="$AVAILABLE_VERSION" \
+      kubelet="$AVAILABLE_VERSION" \
+      kubeadm="$AVAILABLE_VERSION"
+    
+    # Hold packages
+    run_or_die apt-mark hold kubelet kubeadm kubectl
+    success "Kubernetes components installed"
+    
+    # Install crictl (keep "v" prefix in URL)
+    step "Installing crictl ${CRICTL_VERSION}..."
+    CRICTL_URL="https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz"
+    TMP_CRICTL="/tmp/crictl.tar.gz"
+    mkdir -p /usr/local/bin
+    
+    if retry_curl "$CRICTL_URL" "$TMP_CRICTL"; then
+        if tar -tzf "$TMP_CRICTL" >/dev/null 2>&1; then
+            tar -xzf "$TMP_CRICTL" -C /usr/local/bin
+            rm -f "$TMP_CRICTL"
+            success "crictl installed"
+        else
+            warn "crictl archive is not valid"
+            rm -f "$TMP_CRICTL"
+        fi
+    else
+        warn "Failed to download crictl"
+    fi
+    
+    # Configure kubelet
+    step "Configuring kubelet..."
+    mkdir -p /var/lib/kubelet
+    cat > /etc/default/kubelet <<EOF
+KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/containerd/containerd.sock --cgroup-driver=systemd
+EOF
+    
+    mkdir -p /etc/kubernetes/manifests
+    cat > /var/lib/kubelet/config.yaml <<EOF
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+containerRuntimeEndpoint: unix:///var/run/containerd/containerd.sock
+staticPodPath: /etc/kubernetes/manifests
+EOF
+    success "Kubelet configured"
+    
+    # Verify swap is disabled
+    step "Verifying swap is disabled..."
+    if swapon --show | grep -q .; then
+        error "Swap is enabled! Kubernetes requires swap to be disabled."
+        exit 1
+    else
+        success "Swap is disabled"
+    fi
+    
+    # Enable kubelet
+    step "Enabling kubelet service..."
+    systemctl daemon-reload
+    systemctl enable kubelet
+    success "kubelet service enabled"
+    
+    success "Kubernetes installation completed"
+    
+    # ----------------------------------------------------------------------
+    # STEP 4b: Pre-load Kubernetes Images
+    # ----------------------------------------------------------------------
+    step "Pre-loading Kubernetes container images"
+    
+    info "Waiting for containerd to be ready..."
+    timeout=120
+    counter=0
+    while ! crictl info &>/dev/null && [ $counter -lt $timeout ]; do
+        sleep 2
+        counter=$((counter + 2))
+    done
+    
+    if crictl info &>/dev/null; then
+        IMAGE_COUNT=0
+        # Use the actual installed version (K8S_PURE_VERSION) for image list
+        # This ensures images match the installed kubeadm version
+        for image in $(kubeadm config images list --kubernetes-version="v${K8S_PURE_VERSION}" 2>/dev/null || kubeadm config images list 2>/dev/null); do
+            info "Pulling: $image"
+            if crictl pull "$image" 2>/dev/null; then
+                IMAGE_COUNT=$((IMAGE_COUNT + 1))
+            fi
+        done
+        if [ $IMAGE_COUNT -gt 0 ]; then
+            success "Pre-loaded ${IMAGE_COUNT} Kubernetes image(s) for version v${K8S_PURE_VERSION}"
+        fi
+    else
+        warn "containerd not ready, skipping image pre-load"
+    fi
+    
+    # ----------------------------------------------------------------------
+    # STEP 5: Monitoring Components (Enabled by Default)
+    # ----------------------------------------------------------------------
+    step "Installing monitoring components..."
+    
+    # 5.1: Monitoring Base (journald, logrotate)
+    step "Configuring journald and logrotate for monitoring"
+    
+    # Harden journald configuration (use drop-in for upgrade safety)
+    mkdir -p /etc/systemd/journald.conf.d
+    cat > /etc/systemd/journald.conf.d/99-k8s.conf <<'JOURNALD_EOF'
+[Journal]
+# Storage mode: auto, persistent, volatile, none
+Storage=auto
+
+# Maximum disk space for journal files
+SystemMaxUse=100M
+RuntimeMaxUse=50M
+
+# Compress old journal files
+Compress=yes
+
+# Sync interval (write to disk)
+SyncIntervalSec=5m
+
+# Rate limiting to prevent log spam
+RateLimitInterval=30s
+RateLimitBurst=5000
+
+# Maximum number of journal files to keep
+MaxRetentionSec=1month
+
+# Forward to syslog
+ForwardToSyslog=yes
+JOURNALD_EOF
+    
+    systemctl restart systemd-journald
+    success "journald configuration updated (upgrade-safe drop-in)"
+    
+    # Configure logrotate
+    mkdir -p /etc/logrotate.d
+    cat > /etc/logrotate.d/k8s-node <<'EOF'
+/var/log/syslog
+/var/log/kern.log
+/var/log/auth.log
+{
+    rotate 7
+    daily
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+}
+EOF
+    success "logrotate configuration created"
+    
+    # 5.2: Chrony (Time Synchronization)
+    step "Installing and configuring chrony for time synchronization"
+    
+    run_or_die apt-get update -qq
+    run_or_die apt-get install -y chrony
+    
+    mkdir -p /etc/chrony
+    cat > /etc/chrony/chrony.conf <<'EOF'
+# Cloudflare NTP (fast and reliable)
+pool time.cloudflare.com iburst
+
+# Fallback to pool.ntp.org
+pool pool.ntp.org iburst
+
+# Configuration
+keyfile /etc/chrony/chrony.keys
+driftfile /var/lib/chrony/drift
+logdir /var/log/chrony
+
+# Enable RTC synchronization
+rtcsync
+
+# Log measurements statistics
+log measurements statistics tracking
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable chronyd
+    systemctl start chronyd
+    success "chronyd service enabled and started"
+    
+    # 5.3: Node Exporter (Metrics)
+    step "Installing Prometheus node_exporter ${NODE_EXPORTER_VERSION}"
+    
+    if [ -f /usr/local/bin/node_exporter ] && command -v node_exporter >/dev/null 2>&1; then
+        info "node_exporter already installed, skipping..."
+    else
+        # Create user
+        if ! id -u node_exporter >/dev/null 2>&1; then
+            run_or_die useradd --no-create-home --shell /usr/sbin/nologin node_exporter
+        fi
+        
+        # Download and install
+        cd /tmp
+        if ! retry_curl "https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz" "node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz"; then
+            error "Failed to download node_exporter"
+            exit 1
+        fi
+        run_or_die tar xvf "node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz"
+        run_or_die mv "node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64/node_exporter" /usr/local/bin/node_exporter
+        run_or_die chown node_exporter:node_exporter /usr/local/bin/node_exporter
+        run_or_die chmod +x /usr/local/bin/node_exporter
+        rm -rf "/tmp/node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64" "/tmp/node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz" || true
+        
+        # Install systemd service
+        cat > /etc/systemd/system/node_exporter.service <<'EOF'
+[Unit]
+Description=Prometheus Node Exporter
+Documentation=https://github.com/prometheus/node_exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter \
+    --collector.filesystem.ignored-mount-points="^/(sys|proc|dev|run|boot|var/lib/docker/.+)($|/)" \
+    --collector.filesystem.ignored-fs-types="^(autofs|proc|sysfs|tmpfs|devpts|securityfs|cgroup|pstore|debugfs|mqueue|hugetlbfs|tracefs)$"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        
+        systemctl daemon-reload
+        systemctl enable node_exporter
+        systemctl start node_exporter
+        success "node_exporter service enabled and started"
+    fi
+    
+    # 5.4: Fluent Bit (Log Shipping)
+    step "Installing Fluent Bit ${FLUENT_BIT_VERSION}"
+    
+    if command -v fluent-bit >/dev/null 2>&1; then
+        info "Fluent Bit already installed, skipping..."
+    else
+        # Install prerequisites
+        if ! check_command gpg; then
+            run_or_die apt-get update -qq
+            run_or_die apt-get install -y gpg
+        fi
+        if ! check_command lsb_release; then
+            run_or_die apt-get install -y lsb-release
+        fi
+        
+        # Add Fluent Bit repository
+        mkdir -p /usr/share/keyrings
+        mkdir -p /etc/apt/sources.list.d
+        run_or_die curl -fsSL https://packages.fluentbit.io/fluentbit.key | gpg --dearmor > /usr/share/keyrings/fluentbit.gpg
+        run_or_die echo "deb [signed-by=/usr/share/keyrings/fluentbit.gpg] https://packages.fluentbit.io/debian/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/fluentbit.list
+        
+        # Install Fluent Bit
+        run_or_die apt-get update -qq
+        run_or_die apt-get install -y fluent-bit
+        
+        # Create configuration
+        mkdir -p /etc/fluent-bit
+        cat > /etc/fluent-bit/fluent-bit.conf <<'EOF'
+[SERVICE]
+    Flush        1
+    Daemon       Off
+    Log_Level    warn
+
+[INPUT]
+    Name         systemd
+    Tag          host.*
+    Systemd_Filter  _SYSTEMD_UNIT=kubelet.service
+
+[OUTPUT]
+    Name         forward
+    Match        *
+    Host         127.0.0.1
+    Port         24224
+EOF
+        
+        # Install systemd service
+        cat > /etc/systemd/system/fluent-bit.service <<'EOF'
+[Unit]
+Description=Fluent Bit - Lightweight Log Processor
+Documentation=https://docs.fluentbit.io/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/fluent-bit -c /etc/fluent-bit/fluent-bit.conf
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        
+        systemctl daemon-reload
+        systemctl enable fluent-bit
+        systemctl start fluent-bit
+        success "Fluent Bit service enabled and started"
+    fi
+    
+    success "Monitoring components installation completed"
+    
+    # ----------------------------------------------------------------------
+    # STEP 6: Final System Configuration
+    # ----------------------------------------------------------------------
+    step "Applying final system configuration..."
+    
+    # Disable swap (ensure it's still disabled)
+    swapoff -a || true
+    sed -i '/ swap / s/^/# /' /etc/fstab || true
+    
+    # Apply sysctl settings
+    sysctl --system || true
+    
+    # Load kernel modules
+    modprobe overlay || true
+    modprobe br_netfilter || true
+    
+    # Ensure modules load on boot
+    if [ ! -f /etc/modules-load.d/k8s.conf ]; then
+        cat > /etc/modules-load.d/k8s.conf <<EOF
+overlay
+br_netfilter
+EOF
+    fi
+    
+    success "Final system configuration completed"
+    
+    # ----------------------------------------------------------------------
+    # STEP 7: Cleanup
+    # ----------------------------------------------------------------------
+    step "Cleaning up system"
+    
+    # Remove unnecessary packages
+    run_or_die apt-get autoremove -y
+    run_or_die apt-get autoclean -y
+    
+    # Clear package cache
+    run_or_die apt-get clean
+    
+    # Clear logs (selective - preserve important Kubernetes logs)
+    step "Clearing old logs (preserving Kubernetes logs)..."
+    # Only delete old log files, not recent ones
+    find /var/log -type f -name "*.log" -mtime +7 ! -path "*/kubelet*" ! -path "*/containerd*" ! -path "*/audit*" -delete 2>/dev/null || true
+    find /var/log -type f -name "*.gz" ! -path "*/kubelet*" ! -path "*/containerd*" ! -path "*/audit*" -delete 2>/dev/null || true
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl --vacuum-time=7d 2>/dev/null || true
+        journalctl --vacuum-size=100M 2>/dev/null || true
+    fi
+    
+    # Clear temporary files (preserve monitoring service files if needed)
+    find /tmp -mindepth 1 -maxdepth 1 -type f -mtime +1 -exec rm -f {} + 2>/dev/null || true
+    rm -rf /var/tmp/* 2>/dev/null || true
+    
+    success "Cleanup completed"
+    
+    # ----------------------------------------------------------------------
+    # DONE
+    # ----------------------------------------------------------------------
+    success "K8S NODE BOOTSTRAP COMPLETED"
+    echo "============================================================"
+    echo "   K8S NODE BOOTSTRAP - FINISHED"
+    echo "   Log: $LOGFILE"
+    echo "============================================================"
+    echo ""
+    info "Next steps:"
+    echo "  1. Verify node: sudo /usr/local/bin/verify-node-uniqueness.sh"
+    echo "  2. Join cluster: kubeadm join <control-plane-ip>:6443 --token <token>"
+    echo ""
+    echo ""
+    warn "⚠️  IMPORTANT: YOU MUST reboot before joining the cluster"
+    warn "   Kernel modules, sysctl changes, and systemd configuration require a reboot"
+    warn "   Run: sudo reboot"
+    echo ""
+}
+
+# ============================================================================
+# SCRIPT ENTRY POINT
+# ============================================================================
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --debug|-d)
+            DEBUG=1
+            set -x
+            ;;
+        *)
+            warn "Unknown option: $1"
+            ;;
+    esac
+    shift
+done
+
+# Setup logging
+mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
+exec > >(tee -a "$LOGFILE" 2>/dev/null || cat) 2>&1
+
+# Run main function
+main "$@"
+
+exit 0
+
