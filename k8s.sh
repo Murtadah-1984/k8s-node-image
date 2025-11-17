@@ -719,15 +719,28 @@ EOF
     fi
     success "containerd and runc verified"
     
-    # Configure containerd
+    # Configure containerd (using clean regeneration method to avoid TOML corruption)
     step "Configuring containerd..."
     run_or_die mkdir -p /etc/containerd
     
-    if [ ! -f /etc/containerd/config.toml ]; then
-        if timeout 5 containerd config default > /etc/containerd/config.toml 2>/dev/null; then
-            success "Default containerd configuration generated"
-        else
-            cat > /etc/containerd/config.toml <<'EOF'
+    # Stop containerd if running (required for clean config regeneration)
+    if systemctl is-active --quiet containerd 2>/dev/null; then
+        info "Stopping containerd for configuration update..."
+        systemctl stop containerd || true
+        sleep 1
+    fi
+    
+    # Regenerate clean containerd config (production-grade method)
+    step "Regenerating clean containerd configuration..."
+    if timeout 10 containerd config default > /etc/containerd/config.toml 2>/dev/null; then
+        # Generated from containerd, now ensure SystemdCgroup is enabled
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+        success "Default containerd configuration generated and SystemdCgroup enabled"
+    else
+        # Fallback: create complete, correctly structured minimal config if containerd command fails
+        # This config is 100% complete and requires NO patching - it has everything needed
+        warn "containerd config default command failed, creating complete minimal config..."
+        cat > /etc/containerd/config.toml <<'EOF'
 version = 2
 root = "/var/lib/containerd"
 state = "/run/containerd"
@@ -735,81 +748,35 @@ state = "/run/containerd"
 [grpc]
   address = "/run/containerd/containerd.sock"
 
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-    SystemdCgroup = true
-EOF
-            success "Minimal containerd configuration created"
-        fi
-    fi
-    
-    # Ensure CRI plugin is enabled (only if it's disabled)
-    step "Ensuring CRI plugin is enabled..."
-    if [ -f /etc/containerd/config.toml ]; then
-        # Check if CRI is in disabled_plugins list
-        if grep -q "disabled_plugins" /etc/containerd/config.toml && grep -A 10 "disabled_plugins" /etc/containerd/config.toml | grep -q '"cri"'; then
-            # CRI is disabled, need to enable it
-            sed -i '/disabled_plugins/,/\]/ {
-                s/"cri"//g
-                s/'\''cri'\''//g
-                s/,\s*,/,/g
-                s/\[\s*,/[/g
-                s/,\s*\]/]/g
-            }' /etc/containerd/config.toml
-            success "Removed 'cri' from disabled_plugins list"
-        else
-            # CRI is not disabled (either not in list or list doesn't exist)
-            info "CRI plugin is already enabled, skipping..."
-        fi
-    else
-        warn "containerd config.toml not found, skipping CRI check"
-    fi
-    
-    # Configure systemd cgroup driver (only if not already configured)
-    step "Configuring systemd cgroup driver..."
-    if [ -f /etc/containerd/config.toml ]; then
-        # Check if SystemdCgroup is already set to true
-        if grep -A 2 '\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]' /etc/containerd/config.toml | grep -q "SystemdCgroup = true"; then
-            info "SystemdCgroup is already set to true, skipping..."
-        elif grep -q '\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]' /etc/containerd/config.toml; then
-            # Section exists but SystemdCgroup is false or missing
-            if grep -A 2 '\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]' /etc/containerd/config.toml | grep -q "SystemdCgroup = false"; then
-                sed -i '/\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]/,/^\[/ {
-                    s/SystemdCgroup = false/SystemdCgroup = true/
-                }' /etc/containerd/config.toml
-                success "Updated SystemdCgroup to true"
-            else
-                # Section exists but SystemdCgroup line is missing, add it
-                sed -i '/\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]/a\    SystemdCgroup = true' /etc/containerd/config.toml
-                success "Added SystemdCgroup = true"
-            fi
-        else
-            # Section doesn't exist, add it
-            cat >> /etc/containerd/config.toml <<'EOF'
+[plugins]
+  [plugins."io.containerd.grpc.v1.cri"]
+    sandbox_image = "registry.k8s.io/pause:3.9"
 
-# Systemd cgroup driver configuration for Kubernetes
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-    SystemdCgroup = true
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+      default_runtime_name = "runc"
+
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+          runtime_type = "io.containerd.runc.v2"
+
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+            SystemdCgroup = true
+
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+      [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+        endpoint = ["https://registry-1.docker.io"]
 EOF
-            success "Added SystemdCgroup configuration"
-        fi
-    else
-        warn "containerd config.toml not found, skipping SystemdCgroup configuration"
+        success "Complete minimal containerd configuration created"
     fi
     
-    # Configure registry mirrors (always append if missing)
-    step "Configuring containerd registry mirrors..."
-    if [ -f /etc/containerd/config.toml ] && ! grep -q '\[plugins\."io\.containerd\.grpc\.v1\.cri"\.registry\.mirrors\."docker\.io"\]' /etc/containerd/config.toml; then
-        cat >> /etc/containerd/config.toml <<'EOF'
-
-# Registry mirrors for faster image pulls
-[plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
-  endpoint = ["https://registry-1.docker.io"]
-EOF
-        success "Registry mirrors configured"
-    else
-        info "Registry mirrors already configured"
+    # Validate TOML syntax (basic check)
+    info "Validating containerd configuration..."
+    if command -v containerd >/dev/null 2>&1; then
+        if containerd config dump >/dev/null 2>&1; then
+            success "Configuration validated successfully"
+        else
+            warn "Configuration validation failed, but continuing..."
+        fi
     fi
     
     # Enable and start containerd
@@ -817,7 +784,54 @@ EOF
     systemctl daemon-reload
     systemctl enable containerd
     systemctl start containerd
-    success "containerd service enabled and started"
+    sleep 2
+    
+    # Verify containerd started successfully
+    if systemctl is-active --quiet containerd; then
+        success "containerd service enabled and started"
+    else
+        error "containerd failed to start"
+        info "Checking containerd logs:"
+        journalctl -u containerd -n 20 --no-pager || true
+        exit 1
+    fi
+    
+    # Validate containerd configuration by restarting and checking socket/crictl
+    step "Validating containerd configuration..."
+    info "Restarting containerd to validate config.toml..."
+    systemctl restart containerd
+    sleep 2
+    
+    # Check if socket was created
+    info "Checking containerd socket..."
+    if [ -S /run/containerd/containerd.sock ]; then
+        success "containerd socket created successfully"
+        ls -l /run/containerd/containerd.sock
+    else
+        error "containerd socket not found at /run/containerd/containerd.sock"
+        info "Checking containerd status:"
+        systemctl status containerd --no-pager -l | head -15 || true
+        info "Checking containerd logs:"
+        journalctl -u containerd -n 30 --no-pager | tail -20 || true
+        error "containerd configuration validation failed"
+        exit 1
+    fi
+    
+    # Test crictl connectivity
+    info "Testing crictl connectivity..."
+    if crictl info >/dev/null 2>&1; then
+        success "crictl can connect to containerd"
+        info "containerd info:"
+        crictl info | head -10 || true
+    else
+        error "crictl cannot connect to containerd"
+        info "crictl info output:"
+        crictl info 2>&1 || true
+        error "containerd configuration validation failed - crictl cannot connect"
+        exit 1
+    fi
+    
+    success "containerd configuration validated successfully"
     
     # Install CNI plugins
     step "Installing CNI plugins ${CNI_VERSION}..."
@@ -1440,6 +1454,28 @@ EOF
             success "fluent-bit package already installed"
         fi
         
+        # Find fluent-bit binary location
+        FLUENT_BIT_BIN=$(command -v fluent-bit 2>/dev/null || which fluent-bit 2>/dev/null || echo "")
+        if [ -z "$FLUENT_BIT_BIN" ]; then
+            # Try common locations
+            if [ -f /usr/bin/fluent-bit ]; then
+                FLUENT_BIT_BIN="/usr/bin/fluent-bit"
+            elif [ -f /opt/fluent-bit/bin/fluent-bit ]; then
+                FLUENT_BIT_BIN="/opt/fluent-bit/bin/fluent-bit"
+            elif [ -f /usr/local/bin/fluent-bit ]; then
+                FLUENT_BIT_BIN="/usr/local/bin/fluent-bit"
+            else
+                error "fluent-bit binary not found in common locations"
+                info "Searching for fluent-bit binary..."
+                FLUENT_BIT_BIN=$(find /usr /opt -name fluent-bit -type f 2>/dev/null | head -1)
+                if [ -z "$FLUENT_BIT_BIN" ]; then
+                    error "fluent-bit binary not found. Please check installation."
+                    exit 1
+                fi
+            fi
+        fi
+        info "Found fluent-bit binary at: $FLUENT_BIT_BIN"
+        
         # Create configuration
         mkdir -p /etc/fluent-bit
         cat > /etc/fluent-bit/fluent-bit.conf <<'EOF'
@@ -1460,8 +1496,8 @@ EOF
     Port         24224
 EOF
         
-        # Install systemd service
-        cat > /etc/systemd/system/fluent-bit.service <<'EOF'
+        # Install systemd service with detected binary path
+        cat > /etc/systemd/system/fluent-bit.service <<EOF
 [Unit]
 Description=Fluent Bit - Lightweight Log Processor
 Documentation=https://docs.fluentbit.io/
@@ -1470,7 +1506,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/fluent-bit -c /etc/fluent-bit/fluent-bit.conf
+ExecStart=${FLUENT_BIT_BIN} -c /etc/fluent-bit/fluent-bit.conf
 Restart=always
 RestartSec=5
 
