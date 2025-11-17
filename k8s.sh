@@ -1179,6 +1179,12 @@ EOF
     else
     step "Installing monitoring components..."
     
+    # Clean up any old/incorrect Fluent Bit repository files BEFORE any apt-get update
+    # This prevents "this is not known on line 1" errors during apt-get update
+    info "Cleaning up old Fluent Bit repository files..."
+    rm -f /etc/apt/sources.list.d/fluentbit.list 2>/dev/null || true
+    rm -f /etc/apt/sources.list.d/fluent-bit.list 2>/dev/null || true
+    
     # 5.1: Monitoring Base (journald, logrotate)
     step "Configuring journald and logrotate for monitoring"
     
@@ -1334,7 +1340,7 @@ EOF
         mkdir -p /usr/share/keyrings
         mkdir -p /etc/apt/sources.list.d
         
-        # Clean up any old/incorrect repository files first
+        # Note: Old files are cleaned up at the start of STEP 5, but clean again here to be safe
         rm -f /etc/apt/sources.list.d/fluentbit.list 2>/dev/null || true
         
         # Get codename (official method from Fluent Bit docs)
