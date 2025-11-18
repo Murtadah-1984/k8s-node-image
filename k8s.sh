@@ -582,6 +582,57 @@ EOF
     systemctl start auditd 2>/dev/null || true
     success "Audit logging installed and enabled"
     
+    # CIS Benchmark: Configure password policy (pam_pwquality)
+    step "Configuring password policy (pam_pwquality)..."
+    if ! is_package_installed libpam-pwquality; then
+        run_or_die apt-get update -qq
+        run_or_die apt-get install -y libpam-pwquality
+    fi
+    
+    # Configure /etc/pam.d/common-password to use pam_pwquality
+    if [ -f /etc/pam.d/common-password ]; then
+        # Backup original file
+        cp /etc/pam.d/common-password /etc/pam.d/common-password.bak 2>/dev/null || true
+        
+        # Check if pam_pwquality is already referenced
+        if ! grep -q "pam_pwquality.so" /etc/pam.d/common-password; then
+            # Add pam_pwquality before pam_unix.so
+            if grep -q "pam_unix.so" /etc/pam.d/common-password; then
+                sed -i '/pam_unix.so/i password        requisite                       pam_pwquality.so retry=3' /etc/pam.d/common-password
+            else
+                # If pam_unix.so not found, append to file
+                echo "password        requisite                       pam_pwquality.so retry=3" >> /etc/pam.d/common-password
+            fi
+            success "pam_pwquality configured in /etc/pam.d/common-password"
+        else
+            info "pam_pwquality already configured in /etc/pam.d/common-password"
+        fi
+    else
+        warn "/etc/pam.d/common-password not found, creating it..."
+        mkdir -p /etc/pam.d
+        cat > /etc/pam.d/common-password <<'EOF'
+# /etc/pam.d/common-password - password-related modules common to all services
+password        requisite                       pam_pwquality.so retry=3
+password        [success=1 default=ignore]      pam_unix.so obscure sha512
+password        requisite                       pam_deny.so
+password        required                        pam_permit.so
+EOF
+        success "Created /etc/pam.d/common-password with pam_pwquality"
+    fi
+    
+    # Configure password quality requirements
+    if [ -f /etc/security/pwquality.conf ]; then
+        # Set reasonable password requirements (CIS Level 1)
+        sed -i 's/^#\?minlen.*/minlen = 14/' /etc/security/pwquality.conf 2>/dev/null || echo "minlen = 14" >> /etc/security/pwquality.conf
+        sed -i 's/^#\?dcredit.*/dcredit = -1/' /etc/security/pwquality.conf 2>/dev/null || echo "dcredit = -1" >> /etc/security/pwquality.conf
+        sed -i 's/^#\?ucredit.*/ucredit = -1/' /etc/security/pwquality.conf 2>/dev/null || echo "ucredit = -1" >> /etc/security/pwquality.conf
+        sed -i 's/^#\?ocredit.*/ocredit = -1/' /etc/security/pwquality.conf 2>/dev/null || echo "ocredit = -1" >> /etc/security/pwquality.conf
+        sed -i 's/^#\?lcredit.*/lcredit = -1/' /etc/security/pwquality.conf 2>/dev/null || echo "lcredit = -1" >> /etc/security/pwquality.conf
+        info "Password quality requirements configured"
+    fi
+    
+    success "Password policy configured"
+    
     # Configure hostname
     step "Configuring system hostname..."
     hostnamectl set-hostname "${NODE_HOSTNAME}" 2>/dev/null || echo "${NODE_HOSTNAME}" > /etc/hostname
