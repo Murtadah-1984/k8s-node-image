@@ -538,6 +538,11 @@ net.ipv6.conf.all.accept_source_route = 0
 net.ipv6.conf.default.accept_source_route = 0
 EOF
     run_or_die sysctl --system
+    
+    # Apply log_martians parameters immediately to ensure they take effect
+    sysctl -w net.ipv4.conf.all.log_martians=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.conf.default.log_martians=1 >/dev/null 2>&1 || true
+    
     success "Kernel security parameters configured"
     
     # CIS Benchmark: File Permissions
@@ -1486,107 +1491,49 @@ EOF
         mkdir -p /etc/fluent-bit
         cat > /etc/fluent-bit/fluent-bit.conf <<'EOF'
 [SERVICE]
-    Flush          1
-    Daemon         Off
-    Log_Level      info
-    Parsers_File   parsers.conf
-    HTTP_Server    On
-    HTTP_Listen    0.0.0.0
-    HTTP_Port      2020
+    Flush        1
+    Daemon       Off
+    Log_Level    info
+    Parsers_File parsers.conf
 
-# --------------------------------------------
-# INPUTS
-# --------------------------------------------
-
-# System logs
+# ============================
+# INPUT: Container Logs
+# ============================
 [INPUT]
-    Name        tail
-    Tag         syslog
-    Path        /var/log/syslog
-    Parser      syslog
-    DB          /var/log/flb_syslog.db
-    Mem_Buf_Limit 10MB
-    Skip_Long_Lines On
-
-[INPUT]
-    Name        tail
-    Tag         auth
-    Path        /var/log/auth.log
-    Parser      syslog
-    DB          /var/log/flb_auth.db
-    Mem_Buf_Limit 10MB
-    Skip_Long_Lines On
-
-[INPUT]
-    Name        tail
-    Tag         kernel
-    Path        /var/log/kern.log
-    Parser      syslog
-    DB          /var/log/flb_kern.db
-    Mem_Buf_Limit 10MB
-    Skip_Long_Lines On
-
-# Kubernetes logs (optional)
-[INPUT]
-    Name        tail
-    Tag         kube.*
-    Path        /var/log/containers/*.log
-    Parser      docker
-    DB          /var/log/flb_kube.db
-    Mem_Buf_Limit 50MB
-    Skip_Long_Lines On
+    Name              tail
+    Tag               kube.*
+    Path              /var/log/containers/*.log
+    Parser            docker
+    DB                /var/log/flb_kube.db
+    Mem_Buf_Limit     50MB
+    Skip_Long_Lines   On
     Refresh_Interval  5
-    Docker_Mode   On
+    Docker_Mode       On
 
-# --------------------------------------------
-# FILTERS
-# --------------------------------------------
-
+# ============================
+# FILTER: Add Kubernetes Metadata
+# ============================
 [FILTER]
-    Name     kubernetes
-    Match    kube.*
-    Kube_Tag_Prefix  kube.var.log.containers.
-    Merge_Log    On
-    Keep_Log     Off
-    K8S-Logging.Parser  On
-    K8S-Logging.Exclude On
+    Name                 kubernetes
+    Match                kube.*
+    Kube_Tag_Prefix      kube.var.log.containers.
+    Merge_Log            On
+    Keep_Log             Off
+    K8S-Logging.Parser   On
+    K8S-Logging.Exclude  On
 
-# --------------------------------------------
-# OUTPUT (Elasticsearch)
-# --------------------------------------------
-
+# ============================
+# OUTPUT: Forward to Central Aggregator
+# ============================
 [OUTPUT]
-    Name            es
-    Match           *
-    Host            YOUR_ELASTICSEARCH_IP
-    Port            9200
-    Index           fluentbit-%Y.%m.%d
-    Type            _doc
-    HTTP_User       YOUR_USERNAME
-    HTTP_Passwd     YOUR_PASSWORD
-
-    # Performance
-    Logstash_Format On
-    Replace_Dots    On
-    Retry_Limit     False
-
-    # TLS / Security
-    tls             On
-    tls.verify      Off
-
-    # Buffering
-    Time_Key        time
-    Time_Key_Format %Y-%m-%dT%H:%M:%S
-    Time_Key_Nanos  On
+    Name      forward
+    Match     *
+    Host      CENTRAL_FLUENT_BIT_IP_OR_SERVICE
+    Port      24224
 EOF
         
         # Create parsers configuration file
         cat > /etc/fluent-bit/parsers.conf <<'EOF'
-[PARSER]
-    Name        syslog
-    Format      regex
-    Regex       ^(?<time>[^ ]*\s*[^ ]*) (?<host>[^ ]*) (?<ident>[^:]*): (?<message>.*)$
-
 [PARSER]
     Name        docker
     Format      json
