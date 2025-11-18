@@ -148,7 +148,8 @@ check_cni() {
 
 check_time_sync() {
   section "Time Synchronization (chrony)"
-  if systemctl list-unit-files | grep -q "^chronyd.service"; then
+  # Check if chronyd service exists using systemctl show (most reliable method)
+  if systemctl show "chronyd.service" --property=LoadState --value >/dev/null 2>&1; then
     if check_unit_active "chronyd.service" "chronyd"; then
       chronyc tracking 2>/dev/null || true
     fi
