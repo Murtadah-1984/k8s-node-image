@@ -1450,6 +1450,12 @@ EOF
             
             run_or_die apt-get update -qq
             run_or_die apt-get install -y fluent-bit
+            
+            # Create symlink if fluent-bit is installed in /opt/fluent-bit/bin
+            if [ -f /opt/fluent-bit/bin/fluent-bit ] && [ ! -f /usr/bin/fluent-bit ]; then
+                run_or_die ln -s /opt/fluent-bit/bin/fluent-bit /usr/bin/fluent-bit
+                info "Created symlink: /usr/bin/fluent-bit -> /opt/fluent-bit/bin/fluent-bit"
+            fi
         else
             success "fluent-bit package already installed"
         fi
