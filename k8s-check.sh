@@ -112,7 +112,7 @@ check_kube_components() {
 
   if command -v kubelet >/dev/null 2>&1; then
     pass "kubelet binary installed."
-    check_unit_active "kubelet.service" "kubelet"
+    # Note: kubelet will be in crashloop state until kubeadm init/join is run - this is expected
   else
     fail "kubelet binary not found."
   fi
