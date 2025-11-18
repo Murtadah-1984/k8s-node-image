@@ -366,14 +366,15 @@ VERIFY_EOF
     
     # Install security tools (only missing ones)
     step "Installing security tools and networking utilities..."
-    MISSING_TOOLS=""
+    MISSING_TOOLS=()
     for pkg in ufw fail2ban unattended-upgrades apt-listchanges iptables iproute2 net-tools; do
         if ! is_package_installed "$pkg"; then
-            MISSING_TOOLS="$MISSING_TOOLS $pkg"
+            MISSING_TOOLS+=("$pkg")
         fi
     done
-    if [ -n "$MISSING_TOOLS" ]; then
-        run_or_die apt-get install -y $MISSING_TOOLS
+    if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
+        info "Installing missing packages: ${MISSING_TOOLS[*]}"
+        run_or_die apt-get install -y "${MISSING_TOOLS[@]}"
     else
         info "Security tools already installed, skipping..."
     fi
