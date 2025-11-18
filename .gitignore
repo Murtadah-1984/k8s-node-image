@@ -1,4 +1,6 @@
-# Ignore everything except k8s.sh
+# Ignore everything except k8s.sh and verification scripts
 *
 !.gitignore
 !k8s.sh
+!audit.sh
+!k8s-check.sh
