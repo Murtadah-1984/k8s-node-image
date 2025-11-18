@@ -565,13 +565,44 @@ EOF
     
     # CIS Benchmark: Disable unnecessary services
     step "Disabling unnecessary services..."
-    systemctl stop snapd 2>/dev/null || true
-    systemctl disable snapd 2>/dev/null || true
-    systemctl stop bluetooth 2>/dev/null || true
-    systemctl disable bluetooth 2>/dev/null || true
-    systemctl stop avahi-daemon 2>/dev/null || true
-    systemctl disable avahi-daemon 2>/dev/null || true
-    success "Unnecessary services disabled"
+    
+    # Disable and mask snapd (stronger than just disable)
+    if systemctl list-unit-files | grep -q "^snapd.service"; then
+        systemctl stop snapd 2>/dev/null || true
+        systemctl disable snapd 2>/dev/null || true
+        systemctl mask snapd 2>/dev/null || true
+        info "snapd service stopped, disabled, and masked"
+    fi
+    if systemctl list-unit-files | grep -q "^snapd.socket"; then
+        systemctl stop snapd.socket 2>/dev/null || true
+        systemctl disable snapd.socket 2>/dev/null || true
+        systemctl mask snapd.socket 2>/dev/null || true
+        info "snapd.socket stopped, disabled, and masked"
+    fi
+    
+    # Disable and mask bluetooth
+    if systemctl list-unit-files | grep -q "^bluetooth.service"; then
+        systemctl stop bluetooth 2>/dev/null || true
+        systemctl disable bluetooth 2>/dev/null || true
+        systemctl mask bluetooth 2>/dev/null || true
+        info "bluetooth service stopped, disabled, and masked"
+    fi
+    
+    # Disable and mask avahi-daemon
+    if systemctl list-unit-files | grep -q "^avahi-daemon.service"; then
+        systemctl stop avahi-daemon 2>/dev/null || true
+        systemctl disable avahi-daemon 2>/dev/null || true
+        systemctl mask avahi-daemon 2>/dev/null || true
+        info "avahi-daemon service stopped, disabled, and masked"
+    fi
+    if systemctl list-unit-files | grep -q "^avahi-daemon.socket"; then
+        systemctl stop avahi-daemon.socket 2>/dev/null || true
+        systemctl disable avahi-daemon.socket 2>/dev/null || true
+        systemctl mask avahi-daemon.socket 2>/dev/null || true
+        info "avahi-daemon.socket stopped, disabled, and masked"
+    fi
+    
+    success "Unnecessary services disabled and masked"
     
     # CIS Benchmark: Configure audit logging
     step "Configuring audit logging..."
