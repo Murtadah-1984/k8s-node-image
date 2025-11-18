@@ -996,15 +996,16 @@ EOF
         
         # Install prerequisites (only if missing)
         step "Installing prerequisites for Kubernetes repository..."
-        MISSING_DEPS=""
+        MISSING_DEPS=()
         for pkg in apt-transport-https ca-certificates curl gpg; do
             if ! is_package_installed "$pkg"; then
-                MISSING_DEPS="$MISSING_DEPS $pkg"
+                MISSING_DEPS+=("$pkg")
             fi
         done
-        if [ -n "$MISSING_DEPS" ]; then
+        if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
+            info "Installing missing packages: ${MISSING_DEPS[*]}"
             run_or_die apt-get update -qq
-            run_or_die apt-get install -y $MISSING_DEPS
+            run_or_die apt-get install -y "${MISSING_DEPS[@]}"
         else
             info "Prerequisites already installed, skipping..."
         fi
