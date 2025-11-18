@@ -543,6 +543,16 @@ EOF
     sysctl -w net.ipv4.conf.all.log_martians=1 >/dev/null 2>&1 || true
     sysctl -w net.ipv4.conf.default.log_martians=1 >/dev/null 2>&1 || true
     
+    # Verify the log_martians parameters are actually set
+    if [ "$(sysctl -n net.ipv4.conf.all.log_martians 2>/dev/null || echo '0')" != "1" ]; then
+        warn "net.ipv4.conf.all.log_martians is not set to 1, attempting to fix..."
+        sysctl -w net.ipv4.conf.all.log_martians=1 || true
+    fi
+    if [ "$(sysctl -n net.ipv4.conf.default.log_martians 2>/dev/null || echo '0')" != "1" ]; then
+        warn "net.ipv4.conf.default.log_martians is not set to 1, attempting to fix..."
+        sysctl -w net.ipv4.conf.default.log_martians=1 || true
+    fi
+    
     success "Kernel security parameters configured"
     
     # CIS Benchmark: File Permissions
