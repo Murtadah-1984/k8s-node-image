@@ -39,7 +39,10 @@ require_root() {
 
 check_unit_active() {
   local svc="$1" friendly="$2"
-  if systemctl list-unit-files | grep -q "^$svc"; then
+  
+  # Check if service exists using systemctl show (most reliable method)
+  # systemctl show returns 0 if unit exists, non-zero if not found
+  if systemctl show "$svc" --property=LoadState --value >/dev/null 2>&1; then
     local state
     state=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
     if [[ "$state" == "active" ]]; then
