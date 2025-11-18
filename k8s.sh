@@ -931,11 +931,14 @@ EOF
             success "crictl can connect to containerd"
             info "containerd info:"
             "$CRICTL_BIN" info | head -10 || true
-        else
+        elif [ -n "$CRICTL_BIN" ]; then
             warn "crictl cannot connect to containerd (crictl will be installed later)"
             info "crictl info output:"
             "$CRICTL_BIN" info 2>&1 || true
             info "Note: crictl will be installed in Step 4, socket validation passed"
+        else
+            info "crictl binary not found (will be installed in Step 4)"
+            info "Socket validation passed - containerd is ready"
         fi
     else
         info "crictl not installed yet (will be installed in Step 4)"
