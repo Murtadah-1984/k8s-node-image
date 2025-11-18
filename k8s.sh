@@ -58,7 +58,7 @@ DEBUG=${DEBUG:-0}
 # KUBERNETES_VERSION: Set to minor version (e.g., 1.34) to auto-select latest patch
 #                     Or set to full version (e.g., 1.34.0) for specific patch
 KUBERNETES_VERSION="${KUBERNETES_VERSION:-1.34}"
-CONTAINERD_VERSION="${CONTAINERD_VERSION:-1.7.0}"
+CONTAINERD_VERSION="${CONTAINERD_VERSION:-2.2.0}"
 CNI_VERSION="${CNI_VERSION:-v1.3.0}"
 CRICTL_VERSION="${CRICTL_VERSION:-v1.34.0}"
 NODE_EXPORTER_VERSION="1.7.0"
