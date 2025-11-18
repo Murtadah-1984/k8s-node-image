@@ -1486,20 +1486,112 @@ EOF
         mkdir -p /etc/fluent-bit
         cat > /etc/fluent-bit/fluent-bit.conf <<'EOF'
 [SERVICE]
-    Flush        1
-    Daemon       Off
-    Log_Level    warn
+    Flush          1
+    Daemon         Off
+    Log_Level      info
+    Parsers_File   parsers.conf
+    HTTP_Server    On
+    HTTP_Listen    0.0.0.0
+    HTTP_Port      2020
+
+# --------------------------------------------
+# INPUTS
+# --------------------------------------------
+
+# System logs
+[INPUT]
+    Name        tail
+    Tag         syslog
+    Path        /var/log/syslog
+    Parser      syslog
+    DB          /var/log/flb_syslog.db
+    Mem_Buf_Limit 10MB
+    Skip_Long_Lines On
 
 [INPUT]
-    Name         systemd
-    Tag          host.*
-    Systemd_Filter  _SYSTEMD_UNIT=kubelet.service
+    Name        tail
+    Tag         auth
+    Path        /var/log/auth.log
+    Parser      syslog
+    DB          /var/log/flb_auth.db
+    Mem_Buf_Limit 10MB
+    Skip_Long_Lines On
+
+[INPUT]
+    Name        tail
+    Tag         kernel
+    Path        /var/log/kern.log
+    Parser      syslog
+    DB          /var/log/flb_kern.db
+    Mem_Buf_Limit 10MB
+    Skip_Long_Lines On
+
+# Kubernetes logs (optional)
+[INPUT]
+    Name        tail
+    Tag         kube.*
+    Path        /var/log/containers/*.log
+    Parser      docker
+    DB          /var/log/flb_kube.db
+    Mem_Buf_Limit 50MB
+    Skip_Long_Lines On
+    Refresh_Interval  5
+    Docker_Mode   On
+
+# --------------------------------------------
+# FILTERS
+# --------------------------------------------
+
+[FILTER]
+    Name     kubernetes
+    Match    kube.*
+    Kube_Tag_Prefix  kube.var.log.containers.
+    Merge_Log    On
+    Keep_Log     Off
+    K8S-Logging.Parser  On
+    K8S-Logging.Exclude On
+
+# --------------------------------------------
+# OUTPUT (Elasticsearch)
+# --------------------------------------------
 
 [OUTPUT]
-    Name         forward
-    Match        *
-    Host         0.0.0.0
-    Port         24224
+    Name            es
+    Match           *
+    Host            YOUR_ELASTICSEARCH_IP
+    Port            9200
+    Index           fluentbit-%Y.%m.%d
+    Type            _doc
+    HTTP_User       YOUR_USERNAME
+    HTTP_Passwd     YOUR_PASSWORD
+
+    # Performance
+    Logstash_Format On
+    Replace_Dots    On
+    Retry_Limit     False
+
+    # TLS / Security
+    tls             On
+    tls.verify      Off
+
+    # Buffering
+    Time_Key        time
+    Time_Key_Format %Y-%m-%dT%H:%M:%S
+    Time_Key_Nanos  On
+EOF
+        
+        # Create parsers configuration file
+        cat > /etc/fluent-bit/parsers.conf <<'EOF'
+[PARSER]
+    Name        syslog
+    Format      regex
+    Regex       ^(?<time>[^ ]*\s*[^ ]*) (?<host>[^ ]*) (?<ident>[^:]*): (?<message>.*)$
+
+[PARSER]
+    Name        docker
+    Format      json
+    Time_Key    time
+    Time_Format %Y-%m-%dT%H:%M:%S.%L
 EOF
         
         # Install systemd service with detected binary path
