@@ -402,7 +402,7 @@ configure_netplan() {
         info "Using default nameservers: 1.1.1.1 8.8.8.8"
     fi
     
-    # Create netplan YAML with proper formatting
+    # Create netplan YAML with proper formatting (using routes instead of deprecated gateway4)
     cat > "$netplan_file" <<EOF
 network:
   version: 2
@@ -411,7 +411,9 @@ network:
     ${interface}:
       addresses:
         - ${ip_address}/${prefix}
-      gateway4: ${gateway}
+      routes:
+        - to: default
+          via: ${gateway}
       nameservers:
         addresses:
 ${nameserver_addresses}
