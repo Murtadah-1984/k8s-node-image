@@ -112,7 +112,7 @@ get_current_nameservers() {
     # If no valid nameservers found, use defaults
     if [ $valid_count -eq 0 ]; then
         debug "No valid nameservers detected, using defaults"
-        echo "1.1.1.1 8.8.8.8"
+        echo "8.8.8.8 8.8.4.4"
     else
         echo "$nameservers"
     fi
@@ -345,8 +345,8 @@ configure_netplan() {
     
     # Validate nameservers
     if [ -z "$nameservers" ]; then
-        warn "No nameservers provided, using defaults: 1.1.1.1 8.8.8.8"
-        nameservers="1.1.1.1 8.8.8.8"
+        warn "No nameservers provided, using defaults: 8.8.8.8 8.8.4.4"
+        nameservers="8.8.8.8 8.8.4.4"
     fi
     
     # Build nameserver addresses array (proper YAML format)
@@ -393,13 +393,13 @@ configure_netplan() {
     # If no valid nameservers found, fall back to defaults instead of erroring
     if [ -z "$nameserver_addresses" ] || [ $ns_count -eq 0 ]; then
         if [ $invalid_count -gt 0 ]; then
-            warn "All provided nameservers were invalid, using defaults: 1.1.1.1 8.8.8.8"
+            warn "All provided nameservers were invalid, using defaults: 8.8.8.8 8.8.4.4"
         else
-            warn "No nameservers found, using defaults: 1.1.1.1 8.8.8.8"
+            warn "No nameservers found, using defaults: 8.8.8.8 8.8.4.4"
         fi
-        nameserver_addresses="        - 1.1.1.1
-        - 8.8.8.8"
-        info "Using default nameservers: 1.1.1.1 8.8.8.8"
+        nameserver_addresses="        - 8.8.8.8
+        - 8.8.4.4"
+        info "Using default nameservers: 8.8.8.8 8.8.4.4"
     fi
     
     # Create netplan YAML with proper formatting (using routes instead of deprecated gateway4)
@@ -597,7 +597,7 @@ main() {
     
     # Validate nameservers are not empty and contain valid IPs
     if [ -z "$nameservers" ]; then
-        nameservers="1.1.1.1 8.8.8.8"
+        nameservers="8.8.8.8 8.8.4.4"
         warn "Could not detect nameservers, using defaults: $nameservers"
     else
         # Verify at least one valid IP in the nameservers string
@@ -610,8 +610,8 @@ main() {
         done
         
         if [ $has_valid -eq 0 ]; then
-            warn "Detected nameservers are invalid, using defaults: 1.1.1.1 8.8.8.8"
-            nameservers="1.1.1.1 8.8.8.8"
+            warn "Detected nameservers are invalid, using defaults: 8.8.8.8 8.8.4.4"
+            nameservers="8.8.8.8 8.8.4.4"
         else
             info "Detected nameservers: $nameservers"
         fi
