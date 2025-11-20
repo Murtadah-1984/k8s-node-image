@@ -65,6 +65,8 @@ NODE_EXPORTER_VERSION="1.10.2"
 FLUENT_BIT_VERSION="4.2.0"
 NODE_HOSTNAME="${NODE_HOSTNAME:-k8s-node}"
 TIMEZONE="${TIMEZONE:-Asia/Baghdad}"
+LOKI_HOST="${LOKI_HOST:-loki.default.svc}"
+LOKI_PORT="${LOKI_PORT:-3100}"
 
 # ============================================================================
 # COLOR FUNCTIONS
@@ -1599,7 +1601,7 @@ EOF
         
         # Create configuration
         mkdir -p /etc/fluent-bit
-        cat > /etc/fluent-bit/fluent-bit.conf <<'EOF'
+        cat > /etc/fluent-bit/fluent-bit.conf <<EOF
 [SERVICE]
     Flush        1
     Daemon       Off
@@ -1633,13 +1635,16 @@ EOF
     K8S-Logging.Exclude  On
 
 # ============================
-# OUTPUT: Forward to Central Aggregator
+# OUTPUT: Loki
 # ============================
 [OUTPUT]
-    Name      forward
-    Match     *
-    Host      CENTRAL_FLUENT_BIT_IP_OR_SERVICE
-    Port      24224
+    Name                  loki
+    Match                 *
+    Host                  ${LOKI_HOST}
+    Port                  ${LOKI_PORT}
+    TenantID              ""
+    Labels                {job="fluentbit", node="$HOSTNAME"}
+    Auto_Kubernetes_Labels On
 EOF
         
         # Create parsers configuration file
