@@ -352,25 +352,54 @@ configure_netplan() {
     # Build nameserver addresses array (proper YAML format)
     local nameserver_addresses=""
     local ns_count=0
+    local invalid_count=0
+    
+    debug "Validating nameservers: $nameservers"
     for ns in $nameservers; do
+        # Trim whitespace
+        ns=$(echo "$ns" | xargs)
+        
         # Validate nameserver IP format
         if [[ "$ns" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            if [ $ns_count -eq 0 ]; then
-                nameserver_addresses="        - $ns"
-            else
-                nameserver_addresses="$nameserver_addresses
+            # Additional validation: check each octet is 0-255
+            local valid_ip=1
+            IFS='.' read -ra octets <<< "$ns"
+            for octet in "${octets[@]}"; do
+                if [ "$octet" -gt 255 ] || [ "$octet" -lt 0 ]; then
+                    valid_ip=0
+                    break
+                fi
+            done
+            
+            if [ $valid_ip -eq 1 ]; then
+                if [ $ns_count -eq 0 ]; then
+                    nameserver_addresses="        - $ns"
+                else
+                    nameserver_addresses="$nameserver_addresses
         - $ns"
+                fi
+                ns_count=$((ns_count + 1))
+                debug "Valid nameserver: $ns"
+            else
+                invalid_count=$((invalid_count + 1))
+                warn "Invalid nameserver format (octet out of range): $ns (skipping)"
             fi
-            ns_count=$((ns_count + 1))
         else
+            invalid_count=$((invalid_count + 1))
             warn "Invalid nameserver format: $ns (skipping)"
         fi
     done
     
-    # Ensure we have at least one nameserver
-    if [ -z "$nameserver_addresses" ]; then
-        error "No valid nameservers found"
-        exit 1
+    # If no valid nameservers found, fall back to defaults instead of erroring
+    if [ -z "$nameserver_addresses" ] || [ $ns_count -eq 0 ]; then
+        if [ $invalid_count -gt 0 ]; then
+            warn "All provided nameservers were invalid, using defaults: 1.1.1.1 8.8.8.8"
+        else
+            warn "No nameservers found, using defaults: 1.1.1.1 8.8.8.8"
+        fi
+        nameserver_addresses="        - 1.1.1.1
+        - 8.8.8.8"
+        info "Using default nameservers: 1.1.1.1 8.8.8.8"
     fi
     
     # Create netplan YAML with proper formatting
