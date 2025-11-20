@@ -634,33 +634,57 @@ main() {
     # Apply netplan
     apply_netplan "$selected_ip"
     
-    # Set hostname
-    step "Setting system hostname..."
+    # Set hostname (FORCE APPLY)
+    step "Setting system hostname to: $selected_hostname (FORCE APPLY)..."
     
-    # Set hostname using hostnamectl (preferred method)
+    # Get current hostname for comparison
+    local current_hostname
+    current_hostname=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "")
+    if [ "$current_hostname" = "$selected_hostname" ]; then
+        info "Hostname already set to: $selected_hostname"
+    else
+        info "Changing hostname from: $current_hostname -> $selected_hostname"
+    fi
+    
+    # Method 1: Set using hostnamectl (preferred, applies immediately)
     if command -v hostnamectl >/dev/null 2>&1; then
-        if hostnamectl set-hostname "$selected_hostname" 2>/dev/null; then
+        info "Setting hostname using hostnamectl..."
+        if hostnamectl set-hostname "$selected_hostname" 2>&1; then
             success "Hostname set using hostnamectl: $selected_hostname"
         else
-            warn "hostnamectl failed, trying alternative method..."
-            echo "$selected_hostname" > /etc/hostname
-            success "Hostname set in /etc/hostname: $selected_hostname"
+            warn "hostnamectl failed, trying alternative methods..."
         fi
-    else
-        # Fallback to direct file write
-        echo "$selected_hostname" > /etc/hostname
-        success "Hostname set in /etc/hostname: $selected_hostname"
+    fi
+    
+    # Method 2: Write directly to /etc/hostname (persistent)
+    info "Writing hostname to /etc/hostname..."
+    echo "$selected_hostname" > /etc/hostname
+    run_or_die chmod 644 /etc/hostname
+    success "Hostname written to /etc/hostname: $selected_hostname"
+    
+    # Method 3: Set hostname immediately using hostname command (if available)
+    if command -v hostname >/dev/null 2>&1; then
+        info "Setting hostname immediately using hostname command..."
+        hostname "$selected_hostname" 2>/dev/null || true
     fi
     
     # Update /etc/hosts to include the hostname mapping
-    info "Updating /etc/hosts with hostname mapping..."
+    step "Updating /etc/hosts with hostname mapping..."
     if [ -f /etc/hosts ]; then
-        # Remove old hostname entries (127.0.1.1)
-        sed -i "/^127\.0\.1\.1.*${selected_hostname}/d" /etc/hosts 2>/dev/null || true
-        sed -i "/^127\.0\.1\.1.*$(hostname)/d" /etc/hosts 2>/dev/null || true
+        # Backup /etc/hosts
+        cp /etc/hosts /etc/hosts.bak.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
         
-        # Add new hostname mapping if not already present
-        if ! grep -q "^${selected_ip}.*${selected_hostname}" /etc/hosts 2>/dev/null; then
+        # Remove old hostname entries (127.0.1.1) for current and selected hostname
+        sed -i "/^127\.0\.1\.1.*${selected_hostname}/d" /etc/hosts 2>/dev/null || true
+        if [ -n "$current_hostname" ] && [ "$current_hostname" != "$selected_hostname" ]; then
+            sed -i "/^127\.0\.1\.1.*${current_hostname}/d" /etc/hosts 2>/dev/null || true
+        fi
+        
+        # Remove any existing IP mapping for selected hostname
+        sed -i "/[[:space:]]${selected_hostname}$/d" /etc/hosts 2>/dev/null || true
+        
+        # Add new hostname mapping with selected IP
+        if ! grep -q "^${selected_ip}[[:space:]]" /etc/hosts 2>/dev/null; then
             # Add after localhost entries
             if grep -q "^127\.0\.0\.1" /etc/hosts; then
                 # Insert after the last localhost line
@@ -669,26 +693,71 @@ main() {
             else
                 echo "${selected_ip}    ${selected_hostname}" >> /etc/hosts
             fi
-            success "Added hostname mapping to /etc/hosts: ${selected_ip} -> ${selected_hostname}"
+            success "Added IP-to-hostname mapping: ${selected_ip} -> ${selected_hostname}"
         else
-            info "Hostname mapping already exists in /etc/hosts"
+            # Update existing IP line to include hostname
+            sed -i "s|^${selected_ip}[[:space:]]|${selected_ip}    ${selected_hostname} |" /etc/hosts 2>/dev/null || true
+            info "Updated IP mapping in /etc/hosts"
         fi
         
-        # Also ensure 127.0.1.1 mapping exists (for compatibility)
+        # Ensure 127.0.1.1 mapping exists (for system compatibility)
         if ! grep -q "^127\.0\.1\.1.*${selected_hostname}" /etc/hosts 2>/dev/null; then
             echo "127.0.1.1    ${selected_hostname}" >> /etc/hosts
-            info "Added 127.0.1.1 mapping for compatibility"
+            info "Added 127.0.1.1 mapping for system compatibility"
         fi
     fi
     
-    # Verify hostname was set
-    local current_hostname
-    current_hostname=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "")
-    if [ "$current_hostname" = "$selected_hostname" ]; then
-        success "Hostname verified: $current_hostname"
+    # Force reload hostname (if systemd is available)
+    if systemctl is-system-running >/dev/null 2>&1; then
+        info "Reloading systemd hostname..."
+        systemctl reload-or-restart systemd-hostnamed 2>/dev/null || true
+    fi
+    
+    # Verify hostname was set (multiple methods)
+    step "Verifying hostname was applied..."
+    local verified_hostname=""
+    
+    # Check 1: hostname command
+    if command -v hostname >/dev/null 2>&1; then
+        verified_hostname=$(hostname 2>/dev/null || echo "")
+        if [ "$verified_hostname" = "$selected_hostname" ]; then
+            success "Hostname verified via 'hostname' command: $verified_hostname"
+        else
+            warn "Hostname mismatch: 'hostname' shows '$verified_hostname', expected '$selected_hostname'"
+        fi
+    fi
+    
+    # Check 2: /etc/hostname file
+    local file_hostname
+    file_hostname=$(cat /etc/hostname 2>/dev/null | xargs || echo "")
+    if [ "$file_hostname" = "$selected_hostname" ]; then
+        success "Hostname verified in /etc/hostname: $file_hostname"
     else
-        warn "Hostname may not be fully applied. Current: $current_hostname, Expected: $selected_hostname"
-        warn "You may need to reboot or run: sudo hostnamectl set-hostname $selected_hostname"
+        warn "Hostname mismatch in /etc/hostname: found '$file_hostname', expected '$selected_hostname'"
+    fi
+    
+    # Check 3: hostnamectl
+    if command -v hostnamectl >/dev/null 2>&1; then
+        local hostnamectl_hostname
+        hostnamectl_hostname=$(hostnamectl --static 2>/dev/null | xargs || echo "")
+        if [ "$hostnamectl_hostname" = "$selected_hostname" ]; then
+            success "Hostname verified via hostnamectl: $hostnamectl_hostname"
+        else
+            warn "Hostname mismatch in hostnamectl: found '$hostnamectl_hostname', expected '$selected_hostname'"
+        fi
+    fi
+    
+    # Final verification
+    local final_hostname
+    final_hostname=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "")
+    if [ "$final_hostname" = "$selected_hostname" ]; then
+        success "✅ Hostname successfully set to: $selected_hostname"
+    else
+        error "❌ Hostname may not be fully applied"
+        error "Current hostname: $final_hostname"
+        error "Expected hostname: $selected_hostname"
+        warn "A reboot may be required for the hostname to take full effect"
+        warn "You can also try: sudo hostnamectl set-hostname $selected_hostname && sudo systemctl restart systemd-hostnamed"
     fi
     
     success "Static IP configuration completed! 🎉"
