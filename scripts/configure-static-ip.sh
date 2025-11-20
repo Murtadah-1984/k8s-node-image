@@ -324,17 +324,37 @@ configure_netplan() {
     local netplan_file="/etc/netplan/01-static-ip.yaml"
     info "Creating netplan configuration: $netplan_file"
     
-    # Convert nameservers string to array format
-    local nameserver_list=""
+    # Validate nameservers
+    if [ -z "$nameservers" ]; then
+        warn "No nameservers provided, using defaults: 1.1.1.1 8.8.8.8"
+        nameservers="1.1.1.1 8.8.8.8"
+    fi
+    
+    # Build nameserver addresses array (proper YAML format)
+    local nameserver_addresses=""
+    local ns_count=0
     for ns in $nameservers; do
-        if [ -z "$nameserver_list" ]; then
-            nameserver_list="      - $ns"
+        # Validate nameserver IP format
+        if [[ "$ns" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            if [ $ns_count -eq 0 ]; then
+                nameserver_addresses="        - $ns"
+            else
+                nameserver_addresses="$nameserver_addresses
+        - $ns"
+            fi
+            ns_count=$((ns_count + 1))
         else
-            nameserver_list="$nameserver_list
-      - $ns"
+            warn "Invalid nameserver format: $ns (skipping)"
         fi
     done
     
+    # Ensure we have at least one nameserver
+    if [ -z "$nameserver_addresses" ]; then
+        error "No valid nameservers found"
+        exit 1
+    fi
+    
+    # Create netplan YAML with proper formatting
     cat > "$netplan_file" <<EOF
 network:
   version: 2
@@ -346,17 +366,29 @@ network:
       gateway4: ${gateway}
       nameservers:
         addresses:
-${nameserver_list}
+${nameserver_addresses}
 EOF
     
     success "Netplan configuration created"
     
     # Validate netplan configuration
     step "Validating netplan configuration..."
-    if netplan generate 2>&1; then
+    info "Generated netplan configuration:"
+    cat "$netplan_file" | sed 's/^/  /'
+    echo ""
+    
+    local validation_output
+    validation_output=$(netplan generate 2>&1)
+    local validation_status=$?
+    
+    if [ $validation_status -eq 0 ]; then
         success "Netplan configuration is valid"
     else
         error "Netplan configuration validation failed"
+        error "Validation output:"
+        echo "$validation_output" | sed 's/^/  /'
+        error "Generated YAML file:"
+        cat "$netplan_file" | sed 's/^/  /'
         exit 1
     fi
 }
