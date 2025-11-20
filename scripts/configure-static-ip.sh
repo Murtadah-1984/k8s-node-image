@@ -89,13 +89,32 @@ get_current_gateway() {
 }
 
 get_current_nameservers() {
+    local nameservers=""
+    
     # Try to get nameservers from systemd-resolve or resolvectl
     if command -v resolvectl >/dev/null 2>&1; then
-        resolvectl status | grep -A 10 "DNS Servers" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -2 | tr '\n' ' ' | xargs
-    elif [ -f /etc/resolv.conf ]; then
-        grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}' | head -2 | tr '\n' ' ' | xargs
-    else
+        nameservers=$(resolvectl status 2>/dev/null | grep -A 10 "DNS Servers" | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -2 | tr '\n' ' ' | xargs)
+    fi
+    
+    # Fallback to /etc/resolv.conf if resolvectl didn't work or returned empty
+    if [ -z "$nameservers" ] && [ -f /etc/resolv.conf ]; then
+        nameservers=$(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' | head -2 | tr '\n' ' ' | xargs)
+    fi
+    
+    # Validate that we have at least one valid nameserver
+    local valid_count=0
+    for ns in $nameservers; do
+        if [[ "$ns" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            valid_count=$((valid_count + 1))
+        fi
+    done
+    
+    # If no valid nameservers found, use defaults
+    if [ $valid_count -eq 0 ]; then
+        debug "No valid nameservers detected, using defaults"
         echo "1.1.1.1 8.8.8.8"
+    else
+        echo "$nameservers"
     fi
 }
 
@@ -544,11 +563,27 @@ main() {
     # Get nameservers
     local nameservers
     nameservers=$(get_current_nameservers)
+    
+    # Validate nameservers are not empty and contain valid IPs
     if [ -z "$nameservers" ]; then
         nameservers="1.1.1.1 8.8.8.8"
         warn "Could not detect nameservers, using defaults: $nameservers"
     else
-        info "Detected nameservers: $nameservers"
+        # Verify at least one valid IP in the nameservers string
+        local has_valid=0
+        for ns in $nameservers; do
+            if [[ "$ns" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+                has_valid=1
+                break
+            fi
+        done
+        
+        if [ $has_valid -eq 0 ]; then
+            warn "Detected nameservers are invalid, using defaults: 1.1.1.1 8.8.8.8"
+            nameservers="1.1.1.1 8.8.8.8"
+        else
+            info "Detected nameservers: $nameservers"
+        fi
     fi
     
     # Display configuration summary
