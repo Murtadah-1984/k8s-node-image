@@ -191,29 +191,61 @@ get_available_hostnames() {
     local hosts_file="${1:-/etc/hosts}"
     local hostnames=()
     
-    while IFS= read -r line; do
+    if [ ! -f "$hosts_file" ]; then
+        error "Hosts file not found: $hosts_file"
+        return 1
+    fi
+    
+    debug "Reading hosts file: $hosts_file"
+    
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Trim leading/trailing whitespace
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        
         # Skip comments and empty lines
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ -z "${line// }" ]] && continue
+        [[ "$line" =~ ^# ]] && continue
+        [[ -z "$line" ]] && continue
         
         # Skip localhost entries
-        [[ "$line" =~ 127\.0\.0\.1 ]] && continue
-        [[ "$line" =~ ::1 ]] && continue
-        [[ "$line" =~ 127\.0\.1\.1 ]] && continue
+        [[ "$line" =~ ^127\.0\.0\.1 ]] && continue
+        [[ "$line" =~ ^::1 ]] && continue
+        [[ "$line" =~ ^127\.0\.1\.1 ]] && continue
         
-        # Extract IP and hostnames
-        read -r ip rest <<< "$line"
+        # Extract IP and hostnames (handle multiple spaces/tabs)
+        # Use awk to properly split on whitespace
+        local ip=$(echo "$line" | awk '{print $1}')
+        local rest=$(echo "$line" | awk '{$1=""; print $0}' | sed 's/^[[:space:]]*//')
         
-        # Validate IP address format
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        # Validate IP address format (more robust regex)
+        if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
             # Extract all hostnames after the IP
             for hostname in $rest; do
                 # Skip if it's a comment
                 [[ "$hostname" =~ ^# ]] && break
-                hostnames+=("$hostname")
+                # Skip empty strings
+                [[ -z "$hostname" ]] && continue
+                # Add hostname if not already in array
+                local found=0
+                for existing in "${hostnames[@]}"; do
+                    if [ "$existing" = "$hostname" ]; then
+                        found=1
+                        break
+                    fi
+                done
+                if [ $found -eq 0 ]; then
+                    hostnames+=("$hostname")
+                    debug "Found hostname: $hostname -> $ip"
+                fi
             done
+        else
+            debug "Skipping line (invalid IP format): $line"
         fi
     done < "$hosts_file"
+    
+    if [ ${#hostnames[@]} -eq 0 ]; then
+        debug "No hostnames found in hosts file"
+        return 1
+    fi
     
     printf '%s\n' "${hostnames[@]}" | sort -u
 }
@@ -223,29 +255,47 @@ get_ip_for_hostname() {
     local hosts_file="${2:-/etc/hosts}"
     local ip=""
     
-    while IFS= read -r line; do
+    if [ ! -f "$hosts_file" ]; then
+        error "Hosts file not found: $hosts_file"
+        return 1
+    fi
+    
+    debug "Looking for IP address for hostname: $hostname"
+    
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Trim leading/trailing whitespace
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        
         # Skip comments and empty lines
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ -z "${line// }" ]] && continue
+        [[ "$line" =~ ^# ]] && continue
+        [[ -z "$line" ]] && continue
         
         # Skip localhost entries
-        [[ "$line" =~ 127\.0\.0\.1 ]] && continue
-        [[ "$line" =~ ::1 ]] && continue
-        [[ "$line" =~ 127\.0\.1\.1 ]] && continue
+        [[ "$line" =~ ^127\.0\.0\.1 ]] && continue
+        [[ "$line" =~ ^::1 ]] && continue
+        [[ "$line" =~ ^127\.0\.1\.1 ]] && continue
         
-        # Extract IP and hostnames
-        read -r ip_addr rest <<< "$line"
+        # Extract IP and hostnames (handle multiple spaces/tabs)
+        local ip_addr=$(echo "$line" | awk '{print $1}')
+        local rest=$(echo "$line" | awk '{$1=""; print $0}' | sed 's/^[[:space:]]*//')
         
-        # Check if hostname is in this line
-        if [[ "$rest" =~ $hostname ]]; then
-            # Validate IP address format
-            if [[ "$ip_addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                echo "$ip_addr"
-                return 0
-            fi
+        # Validate IP address format
+        if [[ "$ip_addr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            # Check if hostname is in this line (exact match or word boundary)
+            for h in $rest; do
+                # Skip comments
+                [[ "$h" =~ ^# ]] && break
+                # Check for exact match
+                if [ "$h" = "$hostname" ]; then
+                    echo "$ip_addr"
+                    debug "Found IP for $hostname: $ip_addr"
+                    return 0
+                fi
+            done
         fi
     done < "$hosts_file"
     
+    debug "IP address not found for hostname: $hostname"
     return 1
 }
 
@@ -358,10 +408,24 @@ main() {
     # Get available hostnames
     step "Reading available hostnames from /etc/hosts..."
     local available_hostnames
-    available_hostnames=$(get_available_hostnames)
+    if ! available_hostnames=$(get_available_hostnames); then
+        error "Failed to read hostnames from /etc/hosts"
+        error "Please ensure /etc/hosts exists and contains valid hostname entries"
+        info "Checking /etc/hosts file..."
+        if [ -f /etc/hosts ]; then
+            info "File exists. Showing first 20 lines:"
+            head -20 /etc/hosts | sed 's/^/  /'
+        else
+            error "/etc/hosts file does not exist"
+        fi
+        exit 1
+    fi
     
     if [ -z "$available_hostnames" ]; then
         error "No hostnames found in /etc/hosts (excluding localhost)"
+        info "Please check that /etc/hosts contains entries like:"
+        info "  10.0.20.11   cp-01"
+        info "  10.0.30.41   worker-01"
         exit 1
     fi
     
