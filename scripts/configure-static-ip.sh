@@ -636,8 +636,60 @@ main() {
     
     # Set hostname
     step "Setting system hostname..."
-    hostnamectl set-hostname "$selected_hostname" 2>/dev/null || echo "$selected_hostname" > /etc/hostname
-    success "Hostname set to: $selected_hostname"
+    
+    # Set hostname using hostnamectl (preferred method)
+    if command -v hostnamectl >/dev/null 2>&1; then
+        if hostnamectl set-hostname "$selected_hostname" 2>/dev/null; then
+            success "Hostname set using hostnamectl: $selected_hostname"
+        else
+            warn "hostnamectl failed, trying alternative method..."
+            echo "$selected_hostname" > /etc/hostname
+            success "Hostname set in /etc/hostname: $selected_hostname"
+        fi
+    else
+        # Fallback to direct file write
+        echo "$selected_hostname" > /etc/hostname
+        success "Hostname set in /etc/hostname: $selected_hostname"
+    fi
+    
+    # Update /etc/hosts to include the hostname mapping
+    info "Updating /etc/hosts with hostname mapping..."
+    if [ -f /etc/hosts ]; then
+        # Remove old hostname entries (127.0.1.1)
+        sed -i "/^127\.0\.1\.1.*${selected_hostname}/d" /etc/hosts 2>/dev/null || true
+        sed -i "/^127\.0\.1\.1.*$(hostname)/d" /etc/hosts 2>/dev/null || true
+        
+        # Add new hostname mapping if not already present
+        if ! grep -q "^${selected_ip}.*${selected_hostname}" /etc/hosts 2>/dev/null; then
+            # Add after localhost entries
+            if grep -q "^127\.0\.0\.1" /etc/hosts; then
+                # Insert after the last localhost line
+                sed -i "/^127\.0\.0\.1/a ${selected_ip}    ${selected_hostname}" /etc/hosts 2>/dev/null || \
+                echo "${selected_ip}    ${selected_hostname}" >> /etc/hosts
+            else
+                echo "${selected_ip}    ${selected_hostname}" >> /etc/hosts
+            fi
+            success "Added hostname mapping to /etc/hosts: ${selected_ip} -> ${selected_hostname}"
+        else
+            info "Hostname mapping already exists in /etc/hosts"
+        fi
+        
+        # Also ensure 127.0.1.1 mapping exists (for compatibility)
+        if ! grep -q "^127\.0\.1\.1.*${selected_hostname}" /etc/hosts 2>/dev/null; then
+            echo "127.0.1.1    ${selected_hostname}" >> /etc/hosts
+            info "Added 127.0.1.1 mapping for compatibility"
+        fi
+    fi
+    
+    # Verify hostname was set
+    local current_hostname
+    current_hostname=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "")
+    if [ "$current_hostname" = "$selected_hostname" ]; then
+        success "Hostname verified: $current_hostname"
+    else
+        warn "Hostname may not be fully applied. Current: $current_hostname, Expected: $selected_hostname"
+        warn "You may need to reboot or run: sudo hostnamectl set-hostname $selected_hostname"
+    fi
     
     success "Static IP configuration completed! 🎉"
     info "Configuration file: /etc/netplan/01-static-ip.yaml"
