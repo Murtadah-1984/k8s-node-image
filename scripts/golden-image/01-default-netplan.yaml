@@ -1,0 +1,12 @@
+# Default netplan configuration for golden image post-clone
+# This configuration matches any Ethernet interface starting with 'e' (eth0, enp0s3, etc.)
+# and enables DHCP for automatic network configuration
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    primary:
+      match:
+        name: "e*"
+      dhcp4: true
+

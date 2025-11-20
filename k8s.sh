@@ -670,13 +670,95 @@ EOF
     # Configure hostname
     step "Configuring system hostname..."
     hostnamectl set-hostname "${NODE_HOSTNAME}" 2>/dev/null || echo "${NODE_HOSTNAME}" > /etc/hostname
+    success "Hostname configured: ${NODE_HOSTNAME}"
+    
+    # Configure /etc/hosts with complete cluster hostname mapping
+    step "Configuring /etc/hosts with cluster hostname mappings..."
     if [ -f /etc/hosts ]; then
+        # Backup existing hosts file
+        cp /etc/hosts /etc/hosts.bak.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+        
+        # Create new hosts file with localhost entries first
+        cat > /etc/hosts <<'HOSTS_EOF'
+127.0.0.1   localhost
+::1         localhost
+
+# --------------------------------------------
+# CONTROL PLANES (VLAN 20)
+# --------------------------------------------
+10.0.20.11   cp-01
+10.0.20.12   cp-02
+10.0.20.13   cp-03
+
+# --------------------------------------------
+# KONG API GATEWAY (VLAN 50 - DMZ)
+# --------------------------------------------
+10.0.50.21   kong-01
+10.0.50.22   kong-02
+10.0.50.23   kong-03
+
+# --------------------------------------------
+# CEPH STORAGE (VLAN 40)
+# --------------------------------------------
+10.0.40.31   ceph-01
+10.0.40.32   ceph-02
+10.0.40.33   ceph-mon-01
+
+# --------------------------------------------
+# WORKER NODES (VLAN 30)
+# --------------------------------------------
+10.0.30.41   worker-01
+10.0.30.42   worker-02
+10.0.30.43   worker-03
+10.0.30.44   worker-04
+10.0.30.45   worker-05
+10.0.30.46   worker-06
+10.0.30.47   worker-07
+10.0.30.48   worker-08
+10.0.30.49   worker-09
+10.0.30.50   worker-10
+10.0.30.51   worker-11
+10.0.30.52   worker-12
+10.0.30.53   worker-13
+10.0.30.54   worker-14
+10.0.30.55   worker-15
+10.0.30.56   worker-16
+10.0.30.57   worker-17
+10.0.30.58   worker-18
+
+# --------------------------------------------
+# K8S VIRTUAL ENDPOINTS (your LB VIPs)
+# --------------------------------------------
+# API server load balancer VIP
+10.0.20.10   k8s-api.local
+
+# Ingress VIP for Kong (optional if using L2 MetalLB)
+10.0.50.10   kong-ingress.local
+
+# --------------------------------------------
+# PLATFORM SERVICES (optional mapping)
+# --------------------------------------------
+10.0.60.10   platform-services.local
+10.0.70.10   observability.local
+10.0.80.10   infra-services.local
+HOSTS_EOF
+        
+        # Add node's own hostname entry (preserves 127.0.1.1 mapping for this node)
         if ! grep -q "127.0.1.1.*${NODE_HOSTNAME}" /etc/hosts 2>/dev/null; then
-            sed -i '/^127.0.1.1/d' /etc/hosts
             echo "127.0.1.1 ${NODE_HOSTNAME}" >> /etc/hosts
         fi
+        
+        success "/etc/hosts configured with cluster hostname mappings"
+        info "Hosts file includes: control-planes, workers, Kong, Ceph, and VIP endpoints"
+    else
+        warn "/etc/hosts file not found, creating it..."
+        cat > /etc/hosts <<EOF
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   ${NODE_HOSTNAME}
+EOF
+        success "/etc/hosts created with basic entries"
     fi
-    success "Hostname configured: ${NODE_HOSTNAME}"
     
     # Configure timezone
     step "Setting system timezone..."

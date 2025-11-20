@@ -1,6 +1,9 @@
-# Ignore everything except k8s.sh and verification scripts
+# Ignore everything except specified files and directories
 *
 !.gitignore
 !k8s.sh
 !audit.sh
 !k8s-check.sh
+!README.md
+!scripts/
+!scripts/**
