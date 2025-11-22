@@ -527,8 +527,54 @@ EOF
             sed -i 's/^PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
         fi
         
+        # Also disable ChallengeResponseAuthentication (PAM passwords)
+        if ! grep -q "^ChallengeResponseAuthentication" /etc/ssh/sshd_config; then
+            echo "ChallengeResponseAuthentication no" >> /etc/ssh/sshd_config
+        else
+            sed -i 's/^#ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
+            sed -i 's/^ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
+        fi
+        
+        # Also disable UsePAM if not needed (prevents PAM-based password auth)
+        # Note: We keep UsePAM yes for other features, but ensure PasswordAuthentication is no
+        
         chmod 600 /etc/ssh/sshd_config
-        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+        
+        # Test SSH configuration before restarting
+        info "Testing SSH configuration..."
+        if sshd -t 2>/dev/null; then
+            success "SSH configuration test passed"
+        else
+            error "SSH configuration test failed!"
+            info "Checking SSH configuration syntax..."
+            sshd -t 2>&1 || true
+            warn "Attempting to continue anyway..."
+        fi
+        
+        # Restart SSH service with proper error handling
+        info "Restarting SSH service..."
+        if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
+            sleep 2
+            if systemctl is-active --quiet sshd 2>/dev/null || systemctl is-active --quiet ssh 2>/dev/null; then
+                success "SSH service restarted successfully"
+            else
+                error "SSH service may not be running after restart"
+                systemctl status sshd --no-pager -l | head -10 || systemctl status ssh --no-pager -l | head -10 || true
+            fi
+        else
+            error "Failed to restart SSH service"
+            warn "SSH configuration changes may not be applied"
+        fi
+        
+        # Verify password authentication is disabled
+        info "Verifying SSH configuration..."
+        if grep -q "^PasswordAuthentication no" /etc/ssh/sshd_config; then
+            success "PasswordAuthentication is set to 'no'"
+        else
+            warn "PasswordAuthentication may not be properly configured"
+            grep -i "PasswordAuthentication" /etc/ssh/sshd_config || true
+        fi
+        
         success "SSH security configured"
         
         # Configure SSH authorized keys
@@ -546,8 +592,10 @@ EOF
             chmod 700 "$user_home/.ssh"
             if [ ! -f "$user_home/.ssh/authorized_keys" ]; then
                 touch "$user_home/.ssh/authorized_keys"
-                chmod 600 "$user_home/.ssh/authorized_keys"
             fi
+            # Ensure proper permissions (critical for SSH key authentication)
+            chmod 600 "$user_home/.ssh/authorized_keys"
+            chmod 700 "$user_home/.ssh"
             
             # Add ed25519 key if not exists
             if ! grep -q "AAAAC3NzaC1lZDI1NTE5AAAAIBUEBpd8uyg2y72qrvyNdWaKFMsyze4PtN4epu/4ad31" "$user_home/.ssh/authorized_keys" 2>/dev/null; then
@@ -577,7 +625,25 @@ EOF
             chown -R packer:packer /home/packer/.ssh
         fi
         
+        # Verify authorized_keys permissions
+        info "Verifying authorized_keys permissions..."
+        if [ -f /root/.ssh/authorized_keys ]; then
+            PERMS=$(stat -c "%a" /root/.ssh/authorized_keys 2>/dev/null || stat -f "%OLp" /root/.ssh/authorized_keys 2>/dev/null || echo "unknown")
+            if [ "$PERMS" = "600" ] || [ "$PERMS" = "0600" ]; then
+                success "Root authorized_keys permissions correct: $PERMS"
+            else
+                warn "Root authorized_keys permissions may be incorrect: $PERMS (should be 600)"
+                chmod 600 /root/.ssh/authorized_keys
+            fi
+        fi
+        
         success "SSH authorized keys configured"
+        
+        # Note about "Host key verification failed" error
+        info "Note: If you see 'Host key verification failed' when connecting:"
+        info "  This is a client-side issue. Run on your client:"
+        info "  ssh-keygen -R <server-ip-or-hostname>"
+        info "  Or add the server to known_hosts: ssh-keyscan <server-ip> >> ~/.ssh/known_hosts"
     fi
     
     # CIS Benchmark: Kernel Parameters (separate file to avoid overwrite)
