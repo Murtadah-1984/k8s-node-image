@@ -5,5 +5,7 @@
 !audit.sh
 !k8s-check.sh
 !README.md
-!scripts/
-!scripts/**
+!bootstrap.sh
+!kong.sh
+scripts/
+scripts/**
