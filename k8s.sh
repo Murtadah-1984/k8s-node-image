@@ -511,9 +511,73 @@ EOF
             sed -i 's/^MaxSessions.*/MaxSessions 10/' /etc/ssh/sshd_config
         fi
         
+        # Disable password authentication (key-only authentication)
+        if ! grep -q "^PasswordAuthentication" /etc/ssh/sshd_config; then
+            echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
+        else
+            sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+            sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+        fi
+        
+        # Ensure PubkeyAuthentication is enabled (default, but explicit for clarity)
+        if ! grep -q "^PubkeyAuthentication" /etc/ssh/sshd_config; then
+            echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
+        else
+            sed -i 's/^#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+            sed -i 's/^PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+        fi
+        
         chmod 600 /etc/ssh/sshd_config
         systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
         success "SSH security configured"
+        
+        # Configure SSH authorized keys
+        step "Configuring SSH authorized keys..."
+        SSH_KEY_ED25519="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBUEBpd8uyg2y72qrvyNdWaKFMsyze4PtN4epu/4ad31 murtadah.haddad@gmail.com"
+        SSH_KEY_RSA="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDSxt1YzMjNhAsEl6kaRXKvld1AKK6REAFL5IZGocooCOPWJ3Fq/6eazLxM8TkLMRAGqlEdKGsFxZsl3lSFoAlZ4xetIuoLYR3WzPfqe06BChtzWmVH3Ew9hT9DLE5dCMaLhIYLRHJdw56QKWRTOhZveaFmea/Fas8D5n/2d2IaJNGCPuLESlmsiWNsoSlnjuuR+wwrmBgaJRNw9kT9iXjJWDAqdXnm/cmHAnsGr/HVJNpuTG/OtThy1LKXw31EkA6rZtZlVaNmCJA+0nR9fIDnd8ZXUb5I+2OgYY0KuS434MrxsV/A9GT88TmnCwi7H75//SRmSEdu0jLvNfyVO9tbJLI6v9rkYpi0UnGS+4XS+lEZPKePiPM1lYRldNK1VUgVDQ28qR24kMDwQNvFQ7a6LnkpTGSAcTbJwjouD1BXopV/g6rBzrLwoiJ+EFvbeEQX3d22j89it2vSCR6zTtPFHUKUYpS5El0pax6fHM70+lYPH0oCihkHhy5q0TWS6P6QSONWvp/5EA4jeul4pUbj/4iG2SeBQuua9rMXj9lfqOJJHHr63yerUCEf/2uD0v8h0v4L+G7xv3wFun3Dzn9FUuDcxHzrDaynmqrEivNSBNGcvUmAj/Ni0Aw802BYjO9KaU8c1BVHvNwHXmWKY7Gg5hQ7DVEmiauOVIfqkbgzSw== murtadah.haddad@gmail.com"
+        
+        # Function to add SSH keys to a user
+        add_ssh_keys() {
+            local user_home="$1"
+            local user_name="$2"
+            local keys_added=0
+            
+            mkdir -p "$user_home/.ssh"
+            chmod 700 "$user_home/.ssh"
+            if [ ! -f "$user_home/.ssh/authorized_keys" ]; then
+                touch "$user_home/.ssh/authorized_keys"
+                chmod 600 "$user_home/.ssh/authorized_keys"
+            fi
+            
+            # Add ed25519 key if not exists
+            if ! grep -q "AAAAC3NzaC1lZDI1NTE5AAAAIBUEBpd8uyg2y72qrvyNdWaKFMsyze4PtN4epu/4ad31" "$user_home/.ssh/authorized_keys" 2>/dev/null; then
+                echo "$SSH_KEY_ED25519" >> "$user_home/.ssh/authorized_keys"
+                keys_added=$((keys_added + 1))
+            fi
+            
+            # Add RSA key if not exists
+            if ! grep -q "AAAAB3NzaC1yc2EAAAADAQABAAACAQDSxt1YzMjNhAsEl6kaRXKvld1AKK6REAFL5IZGocooCOPWJ3Fq/6eazLxM8TkLMRAGqlEdKGsFxZsl3lSFoAlZ4xetIuoLYR3WzPfqe06BChtzWmVH3Ew9hT9DLE5dCMaLhIYLRHJdw56QKWRTOhZveaFmea/Fas8D5n/2d2IaJNGCPuLESlmsiWNsoSlnjuuR+wwrmBgaJRNw9kT9iXjJWDAqdXnm/cmHAnsGr/HVJNpuTG/OtThy1LKXw31EkA6rZtZlVaNmCJA+0nR9fIDnd8ZXUb5I+2OgYY0KuS434MrxsV/A9GT88TmnCwi7H75//SRmSEdu0jLvNfyVO9tbJLI6v9rkYpi0UnGS+4XS+lEZPKePiPM1lYRldNK1VUgVDQ28qR24kMDwQNvFQ7a6LnkpTGSAcTbJwjouD1BXopV/g6rBzrLwoiJ+EFvbeEQX3d22j89it2vSCR6zTtPFHUKUYpS5El0pax6fHM70+lYPH0oCihkHhy5q0TWS6P6QSONWvp/5EA4jeul4pUbj/4iG2SeBQuua9rMXj9lfqOJJHHr63yerUCEf/2uD0v8h0v4L+G7xv3wFun3Dzn9FUuDcxHzrDaynmqrEivNSBNGcvUmAj/Ni0Aw802BYjO9KaU8c1BVHvNwHXmWKY7Gg5hQ7DVEmiauOVIfqkbgzSw==" "$user_home/.ssh/authorized_keys" 2>/dev/null; then
+                echo "$SSH_KEY_RSA" >> "$user_home/.ssh/authorized_keys"
+                keys_added=$((keys_added + 1))
+            fi
+            
+            if [ $keys_added -gt 0 ]; then
+                success "Added $keys_added SSH key(s) to $user_name user"
+            else
+                info "All SSH keys already exist for $user_name user"
+            fi
+        }
+        
+        # Add keys to root user
+        add_ssh_keys "/root" "root"
+        
+        # Add keys to packer user if it exists (for build process)
+        if id "packer" &>/dev/null; then
+            add_ssh_keys "/home/packer" "packer"
+            chown -R packer:packer /home/packer/.ssh
+        fi
+        
+        success "SSH authorized keys configured"
     fi
     
     # CIS Benchmark: Kernel Parameters (separate file to avoid overwrite)
